@@ -23,11 +23,8 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer import fp4_quantize, mxfp8_quantize
-from flashinfer.testing.utils import (
-    bench_gpu_time,
-)
-
 from .flashinfer_benchmark_utils import (
+    bench_gpu_time,
     dtype_str_to_torch_dtype,
     enum_type,
     get_device,

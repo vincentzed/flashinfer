@@ -5,6 +5,7 @@ import sys
 # to avoid loading unnecessary dependencies (e.g., mpi4py for non-MPI benchmarks)
 from routines.flashinfer_benchmark_utils import (
     benchmark_apis,
+    configure_statistics,
     full_output_columns,
 )
 
@@ -16,6 +17,9 @@ def run_test(args):
     Args:
         args: Parsed command line arguments containing test configuration
     """
+
+    # Apply adaptive-statistics timing options (no-op unless --use_statistics).
+    configure_statistics(args)
 
     ## Depending on routine type, route to corresponding test routine
     ## Imports are done lazily to avoid loading unnecessary dependencies
@@ -227,6 +231,65 @@ def parse_args(line=sys.argv[1:]):
         ),
     )
 
+    # --- Adaptive (NVBench-style) statistics timing ------------------------
+    # Opt-in: when --use_statistics is set, single-device routines time each
+    # case with bench_gpu_time_with_statistics (adaptive sequential sampling
+    # driven by a stopping criterion) instead of a fixed --num_iters count.
+    # CUPTI-only (cupti-python >= 13); the *_comm routines are unaffected.
+    parser.add_argument(
+        "--use_statistics",
+        action="store_true",
+        default=False,
+        help=(
+            "Use the adaptive NVBench-style statistics timing path "
+            "(bench_gpu_time_with_statistics) for single-device routines. "
+            "Requires CUPTI (cupti-python >= 13); ignores --num_iters."
+        ),
+    )
+    parser.add_argument(
+        "--stats_criterion",
+        type=str,
+        default="stdrel",
+        choices=["stdrel", "sample-count", "entropy"],
+        help="Adaptive stopping criterion (default: stdrel). Only with --use_statistics.",
+    )
+    parser.add_argument(
+        "--stats_max_noise",
+        type=float,
+        default=0.005,
+        help="Target relative stdev for the 'stdrel' criterion (default: 0.005 = 0.5%%).",
+    )
+    parser.add_argument(
+        "--stats_min_time_ms",
+        type=float,
+        default=500.0,
+        help="Min accumulated GPU time (ms) before 'stdrel' may stop (default: 500).",
+    )
+    parser.add_argument(
+        "--stats_max_time_ms",
+        type=float,
+        default=10000.0,
+        help="Wall-clock ceiling (ms) for adaptive sampling (default: 10000).",
+    )
+    parser.add_argument(
+        "--stats_min_samples",
+        type=int,
+        default=10,
+        help="Hard floor on samples before any criterion may stop (default: 10).",
+    )
+    parser.add_argument(
+        "--stats_max_samples",
+        type=int,
+        default=100000,
+        help="Hard cap on adaptive samples (default: 100000).",
+    )
+    parser.add_argument(
+        "--stats_target_samples",
+        type=int,
+        default=100,
+        help="Sample count for the 'sample-count' criterion (default: 100).",
+    )
+
     ## Check routine and pass on to routine-specific argument parser
     ## Imports are done lazily to avoid loading unnecessary dependencies
     if args.routine in benchmark_apis["attention"]:
@@ -291,6 +354,13 @@ def parse_args(line=sys.argv[1:]):
     # use_cupti is deprecated and will be removed in a future release. CUPTI is now enabled by default.
     # If --use_cuda_events is passed, disable use_cupti
     args.use_cupti = not args.use_cuda_events
+
+    # The adaptive statistics path is CUPTI-only; --use_cuda_events does not apply.
+    if args.use_statistics and args.use_cuda_events:
+        print(
+            "[WARNING] --use_statistics is CUPTI-only; ignoring --use_cuda_events "
+            "for routines that use the adaptive timing path."
+        )
 
     return args
 

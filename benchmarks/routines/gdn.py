@@ -28,7 +28,7 @@ from flashinfer.gdn_decode import (
     gated_delta_rule_mtp,
 )
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
-from flashinfer.testing.utils import bench_gpu_time
+from .flashinfer_benchmark_utils import bench_gpu_time
 
 # Add tests/gdn to sys.path so the torch GDN reference is importable (same
 # pattern as routines/mamba.py with tests/mamba), and benchmarks/ for the

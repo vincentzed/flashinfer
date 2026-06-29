@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 import flashinfer
-from flashinfer.testing.utils import bench_gpu_time
+from .flashinfer_benchmark_utils import bench_gpu_time
 
 from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,

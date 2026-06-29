@@ -9,12 +9,12 @@ import flashinfer
 from flashinfer.autotuner import autotune
 from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.testing.utils import (
-    bench_gpu_time,
     dequantize_fp8,
     quantize_fp8,
 )
 
 from .flashinfer_benchmark_utils import (
+    bench_gpu_time,
     dtype_str_to_torch_dtype,
     get_device,
     print_perf_metrics,

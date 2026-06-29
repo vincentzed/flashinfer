@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 import flashinfer
-from flashinfer.testing.utils import bench_gpu_time
+from .flashinfer_benchmark_utils import bench_gpu_time
 
 # Add tests/mamba to sys.path so triton_reference is importable as a package
 _repo_root = os.path.normpath(

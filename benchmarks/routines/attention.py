@@ -28,10 +28,10 @@ from flashinfer.utils import is_sm12x_supported
 from flashinfer.testing.utils import (
     attention_tb_per_sec_with_actual_seq_lens,
     attention_tflops_per_sec_with_actual_seq_lens,
-    bench_gpu_time,
 )
 
 from .flashinfer_benchmark_utils import (
+    bench_gpu_time,
     dtype_str_to_torch_dtype,
     get_device,
     print_perf_metrics,

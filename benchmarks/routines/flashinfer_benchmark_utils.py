@@ -1,8 +1,100 @@
 import argparse
+
 import torch
 
-from flashinfer.testing.utils import set_seed
+from flashinfer.testing.utils import (
+    bench_gpu_time as _bench_gpu_time_fixed,
+    bench_gpu_time_with_statistics as _bench_gpu_time_with_statistics,
+    set_seed,
+)
 from flashinfer.utils import get_compute_capability
+
+
+class _StatisticsConfig:
+    """Adaptive-statistics timing options, populated from CLI args.
+
+    When ``enabled``, the benchmark CLI's :func:`bench_gpu_time` shim routes to
+    the NVBench-style adaptive :func:`bench_gpu_time_with_statistics` path
+    instead of the fixed-iteration timer. Adaptive timing is CUPTI-only and
+    single-device, so routines that aggregate across ranks (the ``*_comm``
+    routines) keep importing the fixed timer from ``flashinfer.testing``
+    directly and are unaffected.
+    """
+
+    def __init__(self) -> None:
+        self.enabled = False
+        self.criterion = "stdrel"
+        self.max_noise = 0.005
+        self.min_time_ms = 500.0
+        self.max_time_ms = 10000.0
+        self.min_samples = 10
+        self.max_samples = 100000
+        self.target_samples = 100
+        self.verbose = 0
+
+
+_statistics_config = _StatisticsConfig()
+
+
+def configure_statistics(args) -> None:
+    """Populate the adaptive-statistics timing config from parsed CLI args.
+
+    Safe to call with any namespace: missing attributes fall back to defaults,
+    so callers that never set the ``--use_statistics`` flags are unaffected.
+    """
+    cfg = _statistics_config
+    cfg.enabled = bool(getattr(args, "use_statistics", False))
+    cfg.criterion = getattr(args, "stats_criterion", "stdrel")
+    cfg.max_noise = getattr(args, "stats_max_noise", 0.005)
+    cfg.min_time_ms = getattr(args, "stats_min_time_ms", 500.0)
+    cfg.max_time_ms = getattr(args, "stats_max_time_ms", 10000.0)
+    cfg.min_samples = getattr(args, "stats_min_samples", 10)
+    cfg.max_samples = getattr(args, "stats_max_samples", 100000)
+    cfg.target_samples = getattr(args, "stats_target_samples", 100)
+    cfg.verbose = getattr(args, "verbose", 0) or 0
+
+
+def bench_gpu_time(fn=None, **kwargs):
+    """Benchmark-CLI timing entry point (drop-in for ``bench_gpu_time``).
+
+    Default behavior is identical to :func:`flashinfer.testing.bench_gpu_time`
+    and returns a list of per-iteration GPU times (ms). When ``--use_statistics``
+    is set on the CLI, it instead drives the adaptive NVBench-style
+    :func:`flashinfer.testing.bench_gpu_time_with_statistics` (CUPTI-only,
+    single-device) and returns that path's per-sample list, so all downstream
+    median / std aggregation and reporting are unchanged.
+
+    ``fn`` may be passed positionally or as ``fn=``. Fixed-timer-only kwargs
+    (``repeat_iters``, ``enable_cupti``, ``sleep_after_run``, ``aggregate_op``,
+    ``dry_run_time_ms``, ...) are accepted and ignored in the adaptive path.
+    """
+    if fn is None:
+        fn = kwargs.pop("fn")
+
+    if not _statistics_config.enabled:
+        return _bench_gpu_time_fixed(fn, **kwargs)
+
+    cfg = _statistics_config
+    samples, stats = _bench_gpu_time_with_statistics(
+        fn,
+        stopping_criterion=cfg.criterion,
+        max_noise=cfg.max_noise,
+        min_time_ms=cfg.min_time_ms,
+        max_time_ms=cfg.max_time_ms,
+        min_samples=cfg.min_samples,
+        max_samples=cfg.max_samples,
+        target_samples=cfg.target_samples,
+        dry_run_iters=kwargs.get("dry_run_iters"),
+        use_cuda_graph=kwargs.get("use_cuda_graph", False),
+        input_args=kwargs.get("input_args", ()),
+        input_kwargs=kwargs.get("input_kwargs"),
+        cold_l2_cache=kwargs.get("cold_l2_cache", True),
+        return_samples=True,
+    )
+    if cfg.verbose >= 1:
+        print(f"[STATS] criterion={cfg.criterion} {stats.summary_str()}")
+    return samples
+
 
 # Output columns for the test results.
 output_column_dict = {

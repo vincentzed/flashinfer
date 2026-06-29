@@ -28,7 +28,7 @@ from flashinfer.quantization.nvfp4_quantization_utils import (
     make_nvfp4_global_scale,
     nvfp4_e4m3_max,
 )
-from flashinfer.testing.utils import bench_gpu_time
+from .flashinfer_benchmark_utils import bench_gpu_time
 
 from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
