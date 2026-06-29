@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import math
 import random
 import time
+from functools import partial
 from typing import Tuple, Any, List, Optional, Callable
 
 import os
@@ -28,6 +30,9 @@ import torch
 from einops import rearrange, reduce, repeat
 
 from flashinfer.utils import round_up
+
+from . import statistics
+from .statistics import BenchmarkStatistics
 
 
 # =============================================================================
@@ -934,6 +939,95 @@ def bench_gpu_time_with_cuda_event(
     return measured_times
 
 
+def _import_cupti_or_raise():
+    """Import CUPTI (>= 13) for the statistics timing path, or raise.
+
+    The adaptive ``bench_gpu_time_with_statistics`` path intentionally does NOT
+    fall back to CUDA events: launch-overhead-free, hardware per-kernel GPU time
+    is what makes the convergence criteria trustworthy, so a missing/old CUPTI is
+    a hard error rather than a silent downgrade.
+    """
+    from importlib.metadata import version as _pkg_version
+
+    try:
+        from cupti import cupti
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "bench_gpu_time_with_statistics requires CUPTI (cupti-python >= 13). "
+            "Install with 'pip install -U cupti-python' (needs CUDA 13+). "
+            "For fixed-count timing without CUPTI, use bench_gpu_time()."
+        ) from e
+
+    cupti_version = _pkg_version("cupti-python")
+    if int(cupti_version.split(".")[0]) < 13:
+        raise RuntimeError(
+            "bench_gpu_time_with_statistics requires cupti-python >= 13.0.0 "
+            f"(found {cupti_version}). Try 'pip install -U cupti-python'."
+        )
+    return cupti
+
+
+def _cupti_kernel_spans(
+    iter_timestamps,
+    launches,
+    kernels,
+    *,
+    start_index: int = 0,
+    kernel_names=None,
+):
+    """Convert per-iteration CPU timestamp windows into GPU kernel spans (ms).
+
+    Shared post-processing for the CUPTI timing paths. For each iteration's
+    ``[start_cpu, end_cpu]`` host window, find the launch/runtime activities in
+    that window (binary search), collect the GPU kernel activities they spawned
+    (via correlation id), and return ``max(kernel.end) - min(kernel.start)`` in
+    milliseconds. Processes ``iter_timestamps[start_index:]`` and threads
+    ``kernel_names`` through so the kernel-set consistency check holds across
+    incremental (batched) calls. Returns ``(spans, kernel_names)``.
+
+    Algorithm matches the inline logic in :func:`bench_gpu_time_with_cupti`
+    (O(N + M log M)).
+    """
+    import bisect
+
+    sorted_launches = sorted(launches, key=lambda launch: launch[0])
+    launch_starts = [launch[0] for launch in sorted_launches]
+
+    corr_id_to_kernels: dict = {}
+    for k in kernels:
+        corr_id_to_kernels.setdefault(k[3], []).append(k)
+
+    def kernel_string(k):
+        # start/end/correlation_id are intentionally excluded from the identity.
+        return f"{k[0]}_{k[4]}_{k[5]}_{k[6]}_{k[7]}"
+
+    spans: list = []
+    for idx in range(start_index, len(iter_timestamps)):
+        start_cpu, end_cpu = iter_timestamps[idx]
+        left_idx = bisect.bisect_left(launch_starts, start_cpu)
+        right_idx = bisect.bisect_right(launch_starts, end_cpu)
+        corr_ids = {sorted_launches[i][2] for i in range(left_idx, right_idx)}
+
+        iter_kernels = []
+        for corr_id in corr_ids:
+            iter_kernels.extend(corr_id_to_kernels.get(corr_id, ()))
+        if not iter_kernels:
+            raise ValueError(f"No kernel activities recorded for iteration {idx}")
+
+        current_names = {kernel_string(k) for k in iter_kernels}
+        if kernel_names is None:
+            kernel_names = current_names
+        elif kernel_names != current_names:
+            raise ValueError(
+                f"Inconsistent kernel names: {kernel_names} != {current_names}"
+            )
+
+        min_start = min(k[1] for k in iter_kernels)
+        max_end = max(k[2] for k in iter_kernels)
+        spans.append((max_end - min_start) / 1e6)  # ns -> ms
+    return spans, kernel_names
+
+
 def bench_gpu_time_with_cupti(
     fn,
     dry_run_iters: int = None,
@@ -1258,58 +1352,8 @@ def bench_gpu_time_with_cupti(
     cupti.activity_disable(cupti.ActivityKind.MEMSET)
     cupti.finalize()
 
-    def generate_kernel_string(kernel):
-        # No start, end, correlation_id is considered in the kernel string
-        return f"{kernel[0]}_{kernel[4]}_{kernel[5]}_{kernel[6]}_{kernel[7]}"
-
-    # Process activities - OPTIMIZED O(N + M log M) algorithm
-    import bisect
-
-    # Step 1: Sort launches by start timestamp - O(M log M)
-    sorted_launches = sorted(launches, key=lambda l: l[0])
-    launch_starts = [l[0] for l in sorted_launches]
-
-    # Step 2: Build correlation_id -> kernels mapping - O(K)
-    corr_id_to_kernels: dict[
-        int, list[tuple[str, float, float, int, int, int, int, int]]
-    ] = {}
-    for k in kernels:
-        corr_id = k[3]
-        if corr_id not in corr_id_to_kernels:
-            corr_id_to_kernels[corr_id] = []
-        corr_id_to_kernels[corr_id].append(k)
-
-    measured_times = []
-    kernel_names = None
-    for idx, (start_cpu, end_cpu) in enumerate(iter_timestamps):
-        # Use binary search to find launches within time range - O(log M)
-        left_idx = bisect.bisect_left(launch_starts, start_cpu)
-        right_idx = bisect.bisect_right(launch_starts, end_cpu)
-
-        # Get correlation IDs for launches in range - O(range size)
-        corr_ids = set(sorted_launches[i][2] for i in range(left_idx, right_idx))
-
-        # Find all GPU kernels using the mapping - O(range size)
-        iter_kernels = []
-        for corr_id in corr_ids:
-            if corr_id in corr_id_to_kernels:
-                iter_kernels.extend(corr_id_to_kernels[corr_id])
-
-        if not iter_kernels:
-            raise ValueError(f"No kernel activities recorded for iteration {idx}")
-        current_kernel_names = set(generate_kernel_string(k) for k in iter_kernels)
-        # check if the kernel names are consistent
-        if kernel_names is None:
-            kernel_names = current_kernel_names
-        else:
-            if kernel_names != current_kernel_names:
-                raise ValueError(
-                    f"Inconsistent kernel names: {kernel_names} != {current_kernel_names}"
-                )
-        min_start = min(k[1] for k in iter_kernels)
-        max_end = max(k[2] for k in iter_kernels)
-        span_ms = (max_end - min_start) / 1e6  # ns to ms
-        measured_times.append(span_ms)
+    # Process activities into per-iteration GPU kernel spans (O(N + M log M)).
+    measured_times, _ = _cupti_kernel_spans(iter_timestamps, launches, kernels)
     measured_times = aggregate_gpu_time_across_ranks(measured_times, aggregate_op)
     return measured_times
 
@@ -1845,3 +1889,467 @@ def count_bytes(*tensors):
         elif t is not None:
             total += t.numel() * t.element_size()
     return total
+
+
+def compute_statistics(times) -> BenchmarkStatistics:
+    """Summarize a list of per-iteration timings into NVBench-style statistics.
+
+    Drop-in companion for :func:`bench_gpu_time` (which returns ``List[float]``):
+    it produces the classic mean/stdev/coefficient-of-variation ("noise") plus
+    the outlier-resistant median/IQR/relative-IQR pair, matching one row of an
+    NVBench cold-time table.
+
+    Args:
+        times: Per-iteration execution times (any consistent unit; FlashInfer's
+            timers return milliseconds).
+
+    Returns:
+        BenchmarkStatistics: see :class:`flashinfer.testing.statistics.BenchmarkStatistics`.
+
+    Example:
+        >>> times = bench_gpu_time(fn=lambda: my_kernel())
+        >>> stats = compute_statistics(times)
+        >>> print(stats.summary_str())
+    """
+    return BenchmarkStatistics.from_samples(times)
+
+
+def _device_index(device) -> int:
+    """Resolve an int CUDA device index from int / str / torch.device."""
+    if isinstance(device, int):
+        return device
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+class _ThrottleMonitor:
+    """Host-side GPU clock throttle screen via NVML.
+
+    Approximates NVBench's throttle rejection (``gpu_frequency.cxx``): if the SM
+    clock sampled right after a kernel completes falls below
+    ``threshold * reference_clock``, the sample is throttled and should be
+    discarded + cooled down. NVBench reads the GPU clock register on-device at
+    kernel start/stop for an exact in-kernel frequency; this reads the SM clock
+    from NVML on the host immediately after ``cudaDeviceSynchronize``, which is a
+    coarser proxy but needs no extra kernel. ``reference_clock`` is the device's
+    max SM clock. Degrades to a no-op (with a warning) if NVML is unavailable.
+    """
+
+    def __init__(self, device, threshold: float) -> None:
+        self.threshold = threshold
+        self._ok = False
+        self._pynvml = None
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(_device_index(device))
+            self._pynvml = pynvml
+            self._handle = handle
+            self.reference_mhz = pynvml.nvmlDeviceGetMaxClockInfo(
+                handle, pynvml.NVML_CLOCK_SM
+            )
+            self._ok = self.reference_mhz > 0
+        except Exception as e:  # NVML missing / no permission / no device
+            warnings.warn(
+                f"Throttle screening unavailable (NVML error: {e}); "
+                "continuing without throttle rejection.",
+                stacklevel=2,
+            )
+
+    def is_throttled(self) -> bool:
+        if not self._ok:
+            return False
+        try:
+            cur = self._pynvml.nvmlDeviceGetClockInfo(
+                self._handle, self._pynvml.NVML_CLOCK_SM
+            )
+        except Exception:
+            return False
+        return cur < self.threshold * self.reference_mhz
+
+    def close(self) -> None:
+        if self._pynvml is not None:
+            with contextlib.suppress(Exception):
+                self._pynvml.nvmlShutdown()
+
+
+def bench_gpu_time_with_statistics(
+    fn,
+    *,
+    stopping_criterion: str = "stdrel",
+    max_noise: float = 0.005,
+    min_time_ms: float = 500.0,
+    max_time_ms: float = 10000.0,
+    min_samples: int = 10,
+    max_samples: int = 100000,
+    target_samples: int = 100,
+    batch_size: Optional[int] = None,
+    dry_run_iters: Optional[int] = None,
+    dry_run_time_ms: float = 25.0,
+    use_cuda_graph: bool = False,
+    throttle_screen: bool = False,
+    throttle_threshold: float = 0.75,
+    throttle_cooldown_ms: float = 5.0,
+    max_consecutive_throttled: int = 100,
+    input_args: Tuple = (),
+    input_kwargs: Optional[dict] = None,
+    cold_l2_cache: bool = True,
+    return_samples: bool = True,
+):
+    """Adaptive, statistically-rigorous GPU timing (NVBench cold-measurement port).
+
+    **Requires CUPTI** (``cupti-python >= 13``, CUDA 13+) and raises if it is not
+    available -- there is no CUDA-event fallback. CUPTI gives hardware per-kernel
+    GPU time that excludes CPU launch overhead, which is exactly what makes the
+    convergence criteria meaningful (it is also how this path closes NVBench's
+    launch-isolation gap without a host-side blocking kernel). For fixed-count
+    timing without CUPTI, use :func:`bench_gpu_time`.
+
+    Unlike :func:`bench_gpu_time` (which runs a *fixed* iteration count and
+    returns the raw list), this drives a **sequential sampling procedure**: run a
+    small batch of cold, L2-flushed, optionally throttle-screened iterations,
+    measure each one's pure GPU time with CUPTI, update running statistics, then
+    ask a swappable stopping criterion "have we seen enough?". Termination is
+    bounded below by a min-sample floor and above by a wall-clock ceiling, so
+    every reported number is the output of a convergence rule -- not "median of N
+    fixed runs". This is the timing methodology you want when the number gates a
+    CI regression or feeds an autotuner's reward.
+
+    Sampling proceeds in batches (``batch_size`` iterations) because CUPTI
+    collects activity records and reports per-iteration spans only after a buffer
+    flush; the criterion is therefore evaluated at batch boundaries (it still
+    sees every individual sample). Smaller batches converge sooner; larger
+    batches amortize CUPTI flush overhead.
+
+    Args:
+        fn (Callable): Kernel function to benchmark.
+        stopping_criterion (str): ``"stdrel"`` (default; converge relative stdev
+            to ``max_noise`` with noise-plateau + invalid-estimate fallbacks),
+            ``"entropy"`` (information-theoretic convergence), or
+            ``"sample-count"`` (deterministic ``target_samples``, for
+            reproducible CI). See :mod:`flashinfer.testing.statistics`.
+        max_noise (float): Target relative stdev for ``stdrel`` (default 0.005 =
+            0.5%, matching NVBench).
+        min_time_ms (float): Minimum *accumulated GPU* time before ``stdrel`` may
+            stop (default 500 ms = NVBench's 0.5 s lower bound).
+        max_time_ms (float): Wall-clock ceiling; the loop always terminates by
+            this (default 10 s).
+        min_samples (int): Hard floor on samples before any criterion can stop.
+        max_samples (int): Hard cap on samples (safety bound).
+        target_samples (int): Sample count for the ``sample-count`` criterion.
+        batch_size (int, optional): Iterations per CUPTI flush / criterion check
+            (default 16). Capped per batch so ``sample-count`` lands exactly on
+            ``target_samples`` and the run never exceeds ``max_samples``.
+        dry_run_iters (int, optional): Warmup iterations (not timed). If None,
+            derived from ``dry_run_time_ms`` and a 5-run estimate.
+        dry_run_time_ms (float): Target warmup duration in ms (default 25).
+        use_cuda_graph (bool): Capture ``fn`` into a CUDA graph and time its
+            replay (default False). CUPTI measures the replayed kernels.
+        throttle_screen (bool): If True, discard samples taken while the GPU SM
+            clock is throttled (below ``throttle_threshold`` of max), with a
+            growing cooldown. Requires NVML (already a FlashInfer dependency);
+            off by default since it adds per-sample host overhead.
+        throttle_threshold (float): Fraction of max SM clock below which a sample
+            is considered throttled (default 0.75).
+        throttle_cooldown_ms (float): Base post-throttle sleep; grows (capped at
+            500 ms) while throttling persists, mirroring NVBench.
+        max_consecutive_throttled (int): Give up screening after this many
+            back-to-back throttled samples (avoids an infinite discard loop).
+        input_args (tuple): Positional arguments to ``fn``.
+        input_kwargs (dict, optional): Keyword arguments to ``fn``.
+        cold_l2_cache (bool): Flush L2 before each sample (default True).
+        return_samples (bool): If True (default) return ``(samples, stats)``;
+            if False return just ``stats``.
+
+    Returns:
+        Tuple[List[float], BenchmarkStatistics] | BenchmarkStatistics:
+        the per-sample GPU times (ms) and/or their summary. ``stats.median`` is
+        the recommended central value; ``stats.noise`` is the coefficient of
+        variation; ``stats.relative_iqr`` is the robust analog.
+
+    Raises:
+        RuntimeError: if CUPTI (cupti-python >= 13) is unavailable.
+
+    Note:
+        Timing is single-device (no cross-rank aggregation). A
+        ``cudaDeviceSynchronize`` per iteration is required to delimit each
+        sample's CUPTI window, so this is heavier per sample than the batched
+        fixed-count path -- the cost of an adaptive procedure.
+
+    Example:
+        >>> samples, stats = bench_gpu_time_with_statistics(
+        ...     fn=run_kernel, input_args=(x, y, out),
+        ...     stopping_criterion="stdrel", throttle_screen=True,
+        ... )
+        >>> print(stats.summary_str())
+    """
+    cupti = _import_cupti_or_raise()
+
+    if input_kwargs is None:
+        input_kwargs = {}
+    has_args = bool(input_args) or bool(input_kwargs)
+
+    def call_fn():
+        if has_args:
+            fn(*input_args, **input_kwargs)
+        else:
+            fn()
+
+    device = _infer_device_from_tensors(input_args, input_kwargs, "cuda")
+
+    buffer = None
+    if cold_l2_cache:
+        # 2x L2 size to ensure a complete flush, matching the fixed-count path.
+        l2_flush_size = get_l2_cache_size(device) * 2
+        buffer = torch.empty(l2_flush_size, device=device, dtype=torch.int8)
+
+    criterion = statistics.make_criterion(
+        stopping_criterion,
+        max_noise=max_noise,
+        min_time=min_time_ms,
+        target_samples=target_samples,
+    )
+
+    # --- CUPTI activity buffer callbacks (mirror bench_gpu_time_with_cupti) ---
+    def func_buffer_requested():
+        return 8 * 1024 * 1024, 0
+
+    def kernel_activity_name(activity):
+        if activity.kind == cupti.ActivityKind.CONCURRENT_KERNEL:
+            return activity.name
+        if activity.kind == cupti.ActivityKind.MEMCPY:
+            return "MEMCPY"
+        if activity.kind == cupti.ActivityKind.MEMSET:
+            return "MEMSET"
+
+    def activity_bytes(activity):
+        if activity.kind in (cupti.ActivityKind.MEMCPY, cupti.ActivityKind.MEMSET):
+            return activity.bytes
+        return 0
+
+    def activity_copy_kind(activity):
+        return activity.copy_kind if activity.kind == cupti.ActivityKind.MEMCPY else 0
+
+    def activity_value(activity):
+        return activity.value if activity.kind == cupti.ActivityKind.MEMSET else 0
+
+    def func_buffer_completed(launches, kernels, activities):
+        for activity in activities:
+            if activity.kind in (
+                cupti.ActivityKind.CONCURRENT_KERNEL,
+                cupti.ActivityKind.MEMCPY,
+                cupti.ActivityKind.MEMSET,
+            ):
+                kernels.append(
+                    (
+                        kernel_activity_name(activity),
+                        activity.start,
+                        activity.end,
+                        activity.correlation_id,
+                        activity_copy_kind(activity),
+                        activity_bytes(activity),
+                        activity_value(activity),
+                        activity.kind,
+                    )
+                )
+            elif activity.kind in (
+                cupti.ActivityKind.RUNTIME,
+                cupti.ActivityKind.DRIVER,
+            ):
+                launches.append(
+                    (
+                        activity.start,
+                        activity.end,
+                        activity.correlation_id,
+                        activity.cbid,
+                        activity.kind,
+                    )
+                )
+
+    # --- Prepare runner (direct call or CUDA graph replay) ---
+    runner = call_fn
+    if use_cuda_graph:
+        torch.cuda.synchronize()
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            for _ in range(3):
+                call_fn()
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call_fn()
+        runner = graph.replay
+
+    # --- 5-run estimate (CUDA events) to size dry-run + batch ---
+    torch.cuda.synchronize()
+    call_fn()  # exclude one-time setup overhead
+    torch.cuda.synchronize()
+    est_start = torch.cuda.Event(enable_timing=True)
+    est_end = torch.cuda.Event(enable_timing=True)
+    est_start.record()
+    for _ in range(5):
+        if buffer is not None:
+            buffer.zero_()
+        runner()
+    est_end.record()
+    torch.cuda.synchronize()
+    estimated_ms = est_start.elapsed_time(est_end) / 5
+
+    if dry_run_iters is None:
+        dry_run_iters = max(1, int(dry_run_time_ms / max(estimated_ms, 1e-9)))
+    batch = 16 if batch_size is None else max(1, int(batch_size))
+
+    torch.cuda.synchronize()
+    for _ in range(dry_run_iters):
+        if buffer is not None:
+            buffer.zero_()
+        runner()
+    torch.cuda.synchronize()
+
+    monitor = _ThrottleMonitor(device, throttle_threshold) if throttle_screen else None
+
+    launches: list = []
+    kernels: list = []
+    iter_timestamps: list = []  # (start_cpu, end_cpu) per executed iteration
+    samples: List[float] = []
+    converted = 0  # number of iter_timestamps already turned into spans
+    kernel_names = None
+    consecutive_throttled = 0
+    num_throttled = 0
+    wall_start = time.perf_counter()
+    timed_out = False
+    stop = False
+
+    cupti.activity_enable(cupti.ActivityKind.RUNTIME)
+    cupti.activity_enable(cupti.ActivityKind.CONCURRENT_KERNEL)
+    cupti.activity_enable(cupti.ActivityKind.DRIVER)
+    cupti.activity_enable(cupti.ActivityKind.MEMCPY)
+    cupti.activity_enable(cupti.ActivityKind.MEMSET)
+    cupti.activity_register_callbacks(
+        func_buffer_requested, partial(func_buffer_completed, launches, kernels)
+    )
+    try:
+        while not stop:
+            # Size this batch: never exceed max_samples; for sample-count, land
+            # exactly on target_samples (preserves CI determinism).
+            this_batch = min(batch, max_samples - len(samples))
+            if isinstance(criterion, statistics.SampleCountCriterion):
+                this_batch = min(this_batch, criterion.target_samples - len(samples))
+            this_batch = max(1, this_batch)
+
+            batch_discarded: List[bool] = []
+            for _ in range(this_batch):
+                if buffer is not None:
+                    buffer.zero_()
+                torch.cuda.synchronize()
+                start_cpu = cupti.get_timestamp()
+                runner()
+                end_cpu = cupti.get_timestamp()
+                # Best-effort throttle read while the kernel is likely still
+                # running; reading post-sync risks catching the idle clock. This
+                # is a host-side proxy -- NVBench reads the clock on-device
+                # (%globaltimer + clock64) across the exact window.
+                throttled = monitor.is_throttled() if monitor is not None else False
+                torch.cuda.synchronize()
+                iter_timestamps.append((start_cpu, end_cpu))
+                batch_discarded.append(throttled)
+                if throttled:
+                    num_throttled += 1
+                    consecutive_throttled += 1
+                    # Cooldown grows while throttling persists (capped at 500 ms),
+                    # letting the card recover -- NVBench's dynamic recovery delay.
+                    cooldown = min(
+                        throttle_cooldown_ms * max(1, consecutive_throttled - 2),
+                        500.0,
+                    )
+                    time.sleep(cooldown / 1000.0)
+                    if consecutive_throttled >= max_consecutive_throttled:
+                        warnings.warn(
+                            f"Throttle screen discarded {consecutive_throttled} "
+                            "consecutive samples; GPU appears persistently "
+                            "throttled. Reporting collected samples (if any).",
+                            stacklevel=2,
+                        )
+                        stop = True
+                        break
+                else:
+                    consecutive_throttled = 0
+
+            # Drain CUPTI buffers and convert this batch's iterations to GPU
+            # spans. new_spans aligns 1:1 with iter_timestamps[converted:], which
+            # is exactly the iterations just executed (so with batch_discarded).
+            cupti.activity_flush_all(0)
+            new_spans, kernel_names = _cupti_kernel_spans(
+                iter_timestamps,
+                launches,
+                kernels,
+                start_index=converted,
+                kernel_names=kernel_names,
+            )
+            converted = len(iter_timestamps)
+            # new_spans aligns 1:1 with the iterations just executed; strict=True
+            # asserts that invariant rather than silently truncating.
+            for span, discarded in zip(new_spans, batch_discarded, strict=True):
+                if discarded:
+                    continue
+                samples.append(span)
+                criterion.add_measurement(span)
+
+            n = len(samples)
+            wall_ms = (time.perf_counter() - wall_start) * 1000.0
+            if n >= min_samples and criterion.is_finished():
+                stop = True
+            elif n >= max_samples:
+                warnings.warn(
+                    f"Reached max_samples={max_samples} before the "
+                    f"'{stopping_criterion}' criterion converged.",
+                    stacklevel=2,
+                )
+                stop = True
+            elif wall_ms >= max_time_ms:
+                timed_out = True
+                stop = True
+    finally:
+        cupti.activity_flush_all(0)
+        cupti.activity_disable(cupti.ActivityKind.RUNTIME)
+        cupti.activity_disable(cupti.ActivityKind.CONCURRENT_KERNEL)
+        cupti.activity_disable(cupti.ActivityKind.DRIVER)
+        cupti.activity_disable(cupti.ActivityKind.MEMCPY)
+        cupti.activity_disable(cupti.ActivityKind.MEMSET)
+        cupti.finalize()
+        if monitor is not None:
+            monitor.close()
+
+    stats = BenchmarkStatistics.from_samples(samples)
+
+    if timed_out:
+        noise = "n/a" if stats.noise is None else f"{stats.noise * 100:.3f}%"
+        if len(samples) < min_samples:
+            warnings.warn(
+                f"Benchmark timed out at max_time_ms={max_time_ms} with only "
+                f"{len(samples)} samples (< min_samples={min_samples}); "
+                "result is low-confidence.",
+                stacklevel=2,
+            )
+        elif stopping_criterion == "stdrel" and (
+            stats.noise is None or stats.noise >= max_noise
+        ):
+            warnings.warn(
+                f"Benchmark timed out at max_time_ms={max_time_ms} before "
+                f"converging: noise={noise} still above max_noise="
+                f"{max_noise * 100:.3f}% after {len(samples)} samples.",
+                stacklevel=2,
+            )
+    if num_throttled:
+        warnings.warn(
+            f"Throttle screen discarded {num_throttled} sample(s) during "
+            "measurement; reported statistics exclude them.",
+            stacklevel=2,
+        )
+
+    if return_samples:
+        return samples, stats
+    return stats

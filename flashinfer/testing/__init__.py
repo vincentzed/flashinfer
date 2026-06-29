@@ -14,6 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from .statistics import (
+    BenchmarkStatistics,
+    EntropyCriterion,
+    OnlineMeanVariance,
+    SampleCountCriterion,
+    StdRelCriterion,
+    make_criterion,
+)
 from .utils import (
     attention_flops,
     attention_flops_with_actual_seq_lens,
@@ -25,6 +33,8 @@ from .utils import (
     bench_gpu_time_with_cupti,
     bench_gpu_time_with_cuda_event,
     bench_gpu_time_with_cudagraph,
+    bench_gpu_time_with_statistics,
+    compute_statistics,
     set_seed,
     sleep_after_kernel_run,
 )
