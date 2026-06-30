@@ -231,11 +231,9 @@ def parse_args(line=sys.argv[1:]):
         ),
     )
 
-    # --- Adaptive (NVBench-style) statistics timing ------------------------
-    # Opt-in: when --use_statistics is set, single-device routines time each
-    # case with bench_gpu_time_with_statistics (adaptive sequential sampling
-    # driven by a stopping criterion) instead of a fixed --num_iters count.
-    # CUPTI-only (cupti-python >= 13); the *_comm routines are unaffected.
+    # Adaptive statistics timing (opt-in). When --use_statistics is set,
+    # single-device routines sample until a stopping criterion converges instead
+    # of running a fixed --num_iters count. CUPTI-only; *_comm routines unaffected.
     parser.add_argument(
         "--use_statistics",
         action="store_true",

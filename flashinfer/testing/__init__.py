@@ -34,7 +34,6 @@ from .utils import (
     bench_gpu_time_with_cuda_event,
     bench_gpu_time_with_cudagraph,
     bench_gpu_time_with_statistics,
-    compute_statistics,
     set_seed,
     sleep_after_kernel_run,
 )

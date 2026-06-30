@@ -1,31 +1,19 @@
-"""
-Numerically-stable benchmark statistics and adaptive stopping criteria.
+"""Numerically stable statistics for adaptive benchmark timing.
 
-This module is a Python port of NVBench's ``nvbench/detail/statistics.cuh`` and
-its stopping criteria (``stdrel``, ``sample-count``, ``entropy``). It provides
-the "statistical rigor" layer that turns a raw list of per-iteration timings
-into a trustworthy measurement:
+Turns a stream of per-iteration timings into a trustworthy measurement. The
+algorithms are ported from NVBench (Apache-2.0 WITH LLVM-exception, Copyright
+NVIDIA):
 
-* :class:`OnlineMeanVariance` -- Welford recurrence (no catastrophic
-  cancellation) with Chan parallel ``merge``.
-* :func:`compute_quartiles` / :func:`compute_robust_noise` -- order statistics
-  (median / IQR) and the outlier-resistant relative-IQR noise.
-* :func:`compute_relative_dispersion` -- the coefficient of variation, i.e. the
-  "Noise" column in an NVBench table.
-* :class:`StdRelCriterion`, :class:`SampleCountCriterion`,
-  :class:`EntropyCriterion` -- swappable adaptive-stopping rules.
-* :class:`BenchmarkStatistics` -- the per-measurement summary bundle (classic
-  mean/stdev/CV plus robust median/IQR), the analog of one NVBench cold-time row.
+- ``OnlineMeanVariance``: running mean and variance via Welford's recurrence,
+  which avoids the cancellation error of the naive ``E[x^2] - E[x]^2`` formula.
+- ``compute_quartiles`` / ``compute_robust_noise``: order statistics and the
+  outlier-resistant relative IQR.
+- ``StdRelCriterion`` / ``SampleCountCriterion`` / ``EntropyCriterion``:
+  interchangeable rules that decide when enough samples have been collected.
+- ``BenchmarkStatistics``: the summary bundle returned to callers.
 
-The C++ originals are licensed Apache-2.0 WITH LLVM-exception (Copyright NVIDIA).
-The algorithms (Welford increment, Bessel correction, nearest-rank percentiles,
-incremental Shannon entropy, sliding-window OLS) are reproduced faithfully so the
-numbers match NVBench; see the reference comments on each piece.
-
-Intentional departure from the repo-global "scripts use Pydantic/Typer" rule:
-this is an internal numeric library module on the hot benchmarking path, so it
-stays ``numpy`` + stdlib ``dataclasses`` to match ``flashinfer/testing`` idioms
-and avoid importing ``torch`` (keeps the math independently importable/testable).
+The module is pure numpy + stdlib (no torch) so the math stays importable and
+testable on its own.
 """
 
 from __future__ import annotations
@@ -37,15 +25,13 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-# Below this many samples NVBench refuses to estimate noise (statistics.cuh:55).
+# Noise is not estimated below this many samples.
 MIN_SAMPLES_FOR_NOISE_ESTIMATE = 5
 
 
-# ---------------------------------------------------------------------------
-# Descriptive statistics (statistics.cuh free functions)
-# ---------------------------------------------------------------------------
+# Descriptive statistics
 def percentile_rank(percentile: int, size: int) -> int:
-    """Nearest-rank index: ``round(p / 100 * (size - 1))`` (statistics.cuh:209)."""
+    """Return the nearest-rank index of ``percentile`` over ``size`` samples."""
     if size <= 0:
         raise ValueError("percentile_rank requires a non-empty sample set")
     p = min(max(percentile, 0), 100)
@@ -53,23 +39,11 @@ def percentile_rank(percentile: int, size: int) -> int:
     return int(round(q * (size - 1)))
 
 
-def compute_percentiles(
-    samples: Sequence[float], percentiles: Sequence[int]
-) -> List[float]:
-    """Nearest-rank percentiles by sorting (statistics.cuh:219)."""
-    if len(samples) == 0:
-        return [math.nan] * len(percentiles)
-    ordered = np.sort(np.asarray(samples, dtype=np.float64))
-    n = ordered.shape[0]
-    return [float(ordered[percentile_rank(p, n)]) for p in percentiles]
-
-
 def compute_quartiles(samples: Sequence[float]) -> Tuple[float, float, float]:
-    """Return ``(q1, median, q3)`` via nearest-rank ranks (statistics.cuh:316).
+    """Return ``(q1, median, q3)`` by nearest rank.
 
-    Mirrors NVBench's complexity-aware path: full sort for small inputs, partial
-    selection (``np.partition`` ~ ``std::nth_element``) once the sample count
-    crosses ``selection_threshold`` so the cost stays O(n) rather than O(n log n).
+    Uses a full sort for small inputs and ``np.partition`` (O(n) selection) once
+    the sample count is large.
     """
     arr = np.asarray(samples, dtype=np.float64)
     n = arr.shape[0]
@@ -92,11 +66,11 @@ def compute_quartiles(samples: Sequence[float]) -> Tuple[float, float, float]:
 
 
 def compute_relative_dispersion(dispersion: float, center: float) -> Optional[float]:
-    """``dispersion / center`` (coefficient of variation), guarded.
+    """Return ``dispersion / center`` (the coefficient of variation).
 
-    Returns ``None`` for a non-positive / non-finite center or a negative /
-    NaN dispersion (statistics.cuh:334). ``+inf`` is intentionally allowed --
-    it means unbounded relative dispersion, not missing data.
+    Returns ``None`` when the ratio would be meaningless: a non-positive or
+    non-finite center, or a negative/NaN dispersion. A ``+inf`` ratio is kept --
+    it means unbounded dispersion, not missing data.
     """
     if (
         not (center > 0.0)
@@ -111,7 +85,7 @@ def compute_relative_dispersion(dispersion: float, center: float) -> Optional[fl
 def compute_relative_interquartile_range(
     first_quartile: float, median: float, third_quartile: float
 ) -> Optional[float]:
-    """Relative IQR ``(q3 - q1) / median`` (statistics.cuh:346)."""
+    """Return the IQR relative to the median, ``(q3 - q1) / median``."""
     iqr = third_quartile - first_quartile
     if not math.isfinite(iqr):
         return None
@@ -124,29 +98,28 @@ def compute_robust_noise(
     median: float,
     third_quartile: float,
 ) -> Optional[float]:
-    """Outlier-resistant noise = relative IQR; ``None`` below the sample floor."""
+    """Return the relative IQR as an outlier-resistant noise estimate.
+
+    Returns ``None`` below ``MIN_SAMPLES_FOR_NOISE_ESTIMATE`` samples.
+    """
     if num_samples < MIN_SAMPLES_FOR_NOISE_ESTIMATE:
         return None
     return compute_relative_interquartile_range(first_quartile, median, third_quartile)
 
 
 def slope_to_degrees(slope: float) -> float:
-    """``atan2(slope, 1)`` in degrees (statistics.cuh:474)."""
+    """Return the angle (in degrees) of a line with the given slope."""
     return math.degrees(math.atan2(slope, 1.0))
 
 
-# ---------------------------------------------------------------------------
-# Welford online mean / variance (statistics.cuh:105)
-# ---------------------------------------------------------------------------
+# Online mean / variance
 class OnlineMeanVariance:
-    """Numerically-stable running mean and variance.
+    """Running mean and variance via Welford's recurrence.
 
-    Keeps the *biased* (MLE) population variance via the Welford recurrence and
-    applies Bessel's correction on read, exactly as NVBench does. ``merge``
-    implements Chan's parallel combination so two partial summaries fuse without
-    re-scanning. This avoids the catastrophic cancellation of the naive
-    ``E[x^2] - E[x]^2`` formula -- which matters precisely in the stable-kernel
-    regime where the variance is tiny relative to the mean.
+    Accumulates the biased (population) variance incrementally and applies
+    Bessel's correction on read, which stays accurate even when the variance is
+    tiny relative to the mean. ``merge`` combines two independent accumulators
+    without rescanning their inputs.
     """
 
     __slots__ = ("_size", "_mean", "_variance")
@@ -175,25 +148,6 @@ class OnlineMeanVariance:
         else:
             self._mean = measurement  # variance stays 0
 
-    def merge(self, other: "OnlineMeanVariance") -> None:
-        """Chan parallel combine (statistics.cuh:161)."""
-        if other._size == 0:
-            return
-        if self._size == 0:
-            self._size = other._size
-            self._mean = other._mean
-            self._variance = other._variance
-            return
-
-        self._size += other._size
-        f = other._size / self._size
-        diff = other._mean - self._mean
-        self._mean += f * diff
-        diff2 = diff * diff
-        # var arg is (self.var - other.var), captured before mutation.
-        var_arg = self._variance - other._variance
-        self._variance += f * ((diff2 - var_arg) - f * diff2)
-
     @property
     def size(self) -> int:
         return self._size
@@ -204,29 +158,26 @@ class OnlineMeanVariance:
 
     @property
     def sample_variance(self) -> float:
-        """Biased (MLE) variance, as accumulated."""
+        """Biased (population) variance."""
         return self._variance
 
     @property
     def unbiased_variance(self) -> float:
-        """Bessel-corrected variance ``var / (1 - 1/n)``; NaN if undefined."""
+        """Bessel-corrected variance, or NaN with fewer than two samples."""
         if self._size <= 1 or self._variance < 0.0:
             return math.nan
         f = 1.0 / self._size
         return self._variance / (1.0 - f)
 
 
-# ---------------------------------------------------------------------------
-# Sliding-window online linear regression (online_linear_regression.cuh)
-# ---------------------------------------------------------------------------
+# Online linear regression
 class OnlineLinearRegression:
-    """Incremental OLS supporting append and ring-buffer slide.
+    """Incremental ordinary least squares over a sliding window.
 
-    Used by :class:`EntropyCriterion` to fit the cumulative-entropy curve over a
-    sliding window. ``slide_window`` keeps the running cross-product correct when
-    the oldest point is evicted and a new one appended, with the window's
-    x-values held fixed at ``0..(window-1)`` -- the same trick as NVBench's
-    ``online_linear_regression::slide_window``.
+    Used by :class:`EntropyCriterion` to track the slope of the
+    cumulative-entropy curve. ``slide_window`` evicts the oldest point and
+    appends a new one while keeping the window's x-values fixed at
+    ``0..count-1``.
     """
 
     __slots__ = ("_sum_x", "_sum_y", "_sum_xy", "_sum_x2", "_sum_y2", "_count")
@@ -251,7 +202,7 @@ class OnlineLinearRegression:
         self._count += 1
 
     def slide_window(self, y_out: float, y_in: float) -> None:
-        """Evict oldest ``y_out``, append ``y_in``; x-values stay 0..count-1."""
+        """Replace the oldest sample ``y_out`` with ``y_in`` (x-values unchanged)."""
         self._sum_y -= y_out
         self._sum_y += y_in
 
@@ -310,17 +261,15 @@ class OnlineLinearRegression:
         return min(max(ss_tot_m_res / ss_tot, 0.0), 1.0)
 
 
-# ---------------------------------------------------------------------------
-# Measurement summary bundle
-# ---------------------------------------------------------------------------
+# Summary bundle
 @dataclass(frozen=True)
 class BenchmarkStatistics:
-    """One measurement's worth of summary stats -- an NVBench cold-time row.
+    """Summary statistics for one set of timing samples.
 
-    ``noise`` is the coefficient of variation (classic, mean-based).
-    ``relative_iqr`` is the robust, outlier-resistant analog. Both are ``None``
-    when there are too few samples (< ``MIN_SAMPLES_FOR_NOISE_ESTIMATE``) or the
-    center is degenerate, so a low-confidence number is never silently reported.
+    ``noise`` is the coefficient of variation (stdev / mean); ``relative_iqr``
+    is its outlier-resistant counterpart. Both are ``None`` when there are too
+    few samples or the center is degenerate, so a low-confidence figure is never
+    reported as if it were solid.
     """
 
     num_samples: int
@@ -337,6 +286,7 @@ class BenchmarkStatistics:
 
     @classmethod
     def from_samples(cls, samples: Sequence[float]) -> "BenchmarkStatistics":
+        """Build a summary from raw timing samples (empty input yields all-NaN)."""
         arr = np.asarray(samples, dtype=np.float64)
         n = int(arr.shape[0])
         if n == 0:
@@ -370,6 +320,7 @@ class BenchmarkStatistics:
         )
 
     def summary_str(self, unit: str = "ms") -> str:
+        """Return a compact one-line summary for logging."""
         noise = "n/a" if self.noise is None else f"{self.noise * 100:.2f}%"
         riqr = "n/a" if self.relative_iqr is None else f"{self.relative_iqr * 100:.2f}%"
         return (
@@ -378,30 +329,14 @@ class BenchmarkStatistics:
             f"std {self.stdev:.4f} {unit}; n={self.num_samples}"
         )
 
-    def to_dict(self) -> dict:
-        return {
-            "num_samples": self.num_samples,
-            "mean": self.mean,
-            "stdev": self.stdev,
-            "noise": self.noise,
-            "median": self.median,
-            "q1": self.q1,
-            "q3": self.q3,
-            "iqr": self.iqr,
-            "relative_iqr": self.relative_iqr,
-            "min": self.minimum,
-            "max": self.maximum,
-        }
 
-
-# ---------------------------------------------------------------------------
-# Stopping criteria (stopping_criterion.cuh interface)
-# ---------------------------------------------------------------------------
+# Stopping criteria
 class StoppingCriterion:
-    """Interface: ``reset`` -> ``add_measurement`` (per sample) -> ``is_finished``.
+    """Base class for adaptive stopping rules.
 
-    Measurements and any time parameters share the same unit (FlashInfer feeds
-    milliseconds).
+    Lifecycle per run: ``reset()``, then ``add_measurement()`` once per sample,
+    checking ``is_finished()`` after each. Measurements use whatever time unit
+    the caller provides (FlashInfer uses milliseconds).
     """
 
     name = "base"
@@ -416,28 +351,23 @@ class StoppingCriterion:
         raise NotImplementedError
 
 
-# Tolerate transient invalid noise estimates but terminate after this many
-# consecutive ones (stdrel_criterion.cxx:32).
+# Stop after this many consecutive non-finite noise estimates (e.g. a kernel
+# that reports zero time).
 _INVALID_NOISE_ESTIMATE_LIMIT = 64
 
 
 class StdRelCriterion(StoppingCriterion):
-    """Converge the relative standard deviation (NVBench default ``stdrel``).
+    """Stop when the relative standard deviation is small and stable.
 
-    Stops once the relative stdev (noise) has dropped below ``max_noise`` *and*
-    at least ``min_time`` of accumulated measured time has elapsed. Two escape
-    hatches keep inherently-noisy or degenerate kernels from sampling forever:
+    Finishes once the noise (relative stdev) drops below ``max_noise`` and at
+    least ``min_time`` of measured time has accumulated. Two fallbacks keep an
+    inherently noisy kernel from sampling forever: if the noise itself plateaus
+    (its own relative stdev stays under 5% across a window of samples) the
+    current value is accepted, and if the noise estimate is non-finite for too
+    many samples in a row it stops anyway.
 
-    * **Noise-stability fallback** -- after > 64 noise values, every 16 samples,
-      if the relative stdev of the noise series itself is < 5%, declare the noise
-      plateaued and stop (a convergence test on the second moment of the second
-      moment).
-    * **Invalid-estimate termination** -- 64 consecutive non-finite noise
-      estimates (zero-time / degenerate kernels) -> stop.
-
-    Defaults mirror ``stdrel_criterion.cxx``: ``max_noise=0.005`` (0.5%) and
-    ``min_time=0.5`` (NVBench seconds). FlashInfer measures in milliseconds, so
-    its driver passes ``min_time=500.0`` to preserve the 0.5 s semantics.
+    ``min_time`` shares the unit of the measurements, so the driver passes 500.0
+    for NVBench's 0.5 s lower bound in milliseconds.
     """
 
     name = "stdrel"
@@ -499,16 +429,12 @@ class StdRelCriterion(StoppingCriterion):
                     return True
         return False
 
-    @property
-    def current_noise(self) -> Optional[float]:
-        return self._noise_tracker[-1] if self._noise_tracker else None
-
 
 class SampleCountCriterion(StoppingCriterion):
-    """Deterministic N samples (sample_count_criterion.cxx).
+    """Stop after a fixed number of samples.
 
-    Trades statistical adaptivity for run-to-run reproducibility -- the right
-    choice when a CI job needs a fixed sample count.
+    Trades adaptivity for run-to-run reproducibility, which is usually what a CI
+    job wants.
     """
 
     name = "sample-count"
@@ -530,16 +456,13 @@ class SampleCountCriterion(StoppingCriterion):
 
 
 class EntropyCriterion(StoppingCriterion):
-    """Information-theoretic convergence (entropy_criterion.cxx).
+    """Stop when the timing distribution stops revealing new information.
 
-    Instead of "is the variance small?" it asks "is the sample still telling me
-    anything new?": maintain a frequency histogram, track Shannon entropy
-    ``H = log2(n) - (1/n) * sum c_i log2 c_i`` (updated incrementally), fit an
-    online OLS over a sliding window of the cumulative-entropy curve, and stop
-    when that curve has gone flat -- slope angle < ``max_angle`` (0.048 deg) and
-    fit quality ``R^2`` > ``min_r2`` (0.36). Catches multi-modal distributions
-    that ``stdrel`` declares converged too early, and stops earlier on clean
-    unimodal kernels.
+    Tracks the Shannon entropy of the observed timings and fits a line to the
+    cumulative-entropy curve over a sliding window. When that curve flattens
+    (slope below ``max_angle`` with fit quality above ``min_r2``) the sample is
+    considered converged. Handles multi-modal distributions that the
+    relative-stdev rule can declare converged too early.
     """
 
     name = "entropy"
@@ -626,9 +549,11 @@ class EntropyCriterion(StoppingCriterion):
 
 
 def make_criterion(name: str, **params) -> StoppingCriterion:
-    """Build a stopping criterion by name (``stdrel`` / ``sample-count`` /
-    ``entropy``). Unknown ``params`` for a criterion are ignored, matching
-    NVBench's ``criterion_params::set_from``."""
+    """Construct a stopping criterion by name.
+
+    ``name`` is one of ``stdrel``, ``sample-count``, or ``entropy``. Keyword
+    parameters that do not apply to the chosen criterion are ignored.
+    """
     name = name.replace("_", "-").lower()
     if name == "stdrel":
         return StdRelCriterion(

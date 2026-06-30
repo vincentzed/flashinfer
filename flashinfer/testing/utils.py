@@ -940,12 +940,11 @@ def bench_gpu_time_with_cuda_event(
 
 
 def _import_cupti_or_raise():
-    """Import CUPTI (>= 13) for the statistics timing path, or raise.
+    """Import and return the CUPTI module, requiring cupti-python >= 13.
 
-    The adaptive ``bench_gpu_time_with_statistics`` path intentionally does NOT
-    fall back to CUDA events: launch-overhead-free, hardware per-kernel GPU time
-    is what makes the convergence criteria trustworthy, so a missing/old CUPTI is
-    a hard error rather than a silent downgrade.
+    The adaptive path uses CUPTI for launch-overhead-free per-kernel timing and
+    does not fall back to CUDA events, so a missing or too-old CUPTI is a hard
+    error rather than a silent downgrade.
     """
     from importlib.metadata import version as _pkg_version
 
@@ -975,18 +974,14 @@ def _cupti_kernel_spans(
     start_index: int = 0,
     kernel_names=None,
 ):
-    """Convert per-iteration CPU timestamp windows into GPU kernel spans (ms).
+    """Reduce per-iteration CPU windows to GPU kernel spans, in milliseconds.
 
-    Shared post-processing for the CUPTI timing paths. For each iteration's
-    ``[start_cpu, end_cpu]`` host window, find the launch/runtime activities in
-    that window (binary search), collect the GPU kernel activities they spawned
-    (via correlation id), and return ``max(kernel.end) - min(kernel.start)`` in
-    milliseconds. Processes ``iter_timestamps[start_index:]`` and threads
-    ``kernel_names`` through so the kernel-set consistency check holds across
-    incremental (batched) calls. Returns ``(spans, kernel_names)``.
-
-    Algorithm matches the inline logic in :func:`bench_gpu_time_with_cupti`
-    (O(N + M log M)).
+    For each iteration's ``[start_cpu, end_cpu]`` host window, finds the launch
+    activities inside it, gathers the kernels they spawned (by correlation id),
+    and returns ``max(end) - min(start)`` across those kernels. ``start_index``
+    and ``kernel_names`` let it run incrementally over batches while still
+    checking that every iteration ran the same set of kernels. Returns
+    ``(spans, kernel_names)``.
     """
     import bisect
 
@@ -1891,29 +1886,6 @@ def count_bytes(*tensors):
     return total
 
 
-def compute_statistics(times) -> BenchmarkStatistics:
-    """Summarize a list of per-iteration timings into NVBench-style statistics.
-
-    Drop-in companion for :func:`bench_gpu_time` (which returns ``List[float]``):
-    it produces the classic mean/stdev/coefficient-of-variation ("noise") plus
-    the outlier-resistant median/IQR/relative-IQR pair, matching one row of an
-    NVBench cold-time table.
-
-    Args:
-        times: Per-iteration execution times (any consistent unit; FlashInfer's
-            timers return milliseconds).
-
-    Returns:
-        BenchmarkStatistics: see :class:`flashinfer.testing.statistics.BenchmarkStatistics`.
-
-    Example:
-        >>> times = bench_gpu_time(fn=lambda: my_kernel())
-        >>> stats = compute_statistics(times)
-        >>> print(stats.summary_str())
-    """
-    return BenchmarkStatistics.from_samples(times)
-
-
 def _device_index(device) -> int:
     """Resolve an int CUDA device index from int / str / torch.device."""
     if isinstance(device, int):
@@ -1924,16 +1896,12 @@ def _device_index(device) -> int:
 
 
 class _ThrottleMonitor:
-    """Host-side GPU clock throttle screen via NVML.
+    """Detect GPU SM-clock throttling via NVML.
 
-    Approximates NVBench's throttle rejection (``gpu_frequency.cxx``): if the SM
-    clock sampled right after a kernel completes falls below
-    ``threshold * reference_clock``, the sample is throttled and should be
-    discarded + cooled down. NVBench reads the GPU clock register on-device at
-    kernel start/stop for an exact in-kernel frequency; this reads the SM clock
-    from NVML on the host immediately after ``cudaDeviceSynchronize``, which is a
-    coarser proxy but needs no extra kernel. ``reference_clock`` is the device's
-    max SM clock. Degrades to a no-op (with a warning) if NVML is unavailable.
+    Reports a sample as throttled when the current SM clock is below
+    ``threshold`` of the device's maximum SM clock. This is a coarse host-side
+    proxy (read after synchronization, not on-device per kernel). Degrades to a
+    no-op, with a warning, when NVML is unavailable.
     """
 
     def __init__(self, device, threshold: float) -> None:
@@ -1998,92 +1966,54 @@ def bench_gpu_time_with_statistics(
     cold_l2_cache: bool = True,
     return_samples: bool = True,
 ):
-    """Adaptive, statistically-rigorous GPU timing (NVBench cold-measurement port).
+    """Adaptively time a GPU kernel until a statistical stopping rule converges.
 
-    **Requires CUPTI** (``cupti-python >= 13``, CUDA 13+) and raises if it is not
-    available -- there is no CUDA-event fallback. CUPTI gives hardware per-kernel
-    GPU time that excludes CPU launch overhead, which is exactly what makes the
-    convergence criteria meaningful (it is also how this path closes NVBench's
-    launch-isolation gap without a host-side blocking kernel). For fixed-count
-    timing without CUPTI, use :func:`bench_gpu_time`.
+    Unlike :func:`bench_gpu_time`, which runs a fixed iteration count, this keeps
+    sampling until ``stopping_criterion`` is satisfied, bounded below by
+    ``min_samples`` and above by ``max_time_ms`` and ``max_samples``. Each sample
+    is a cold, L2-flushed (and optionally throttle-screened) run timed with CUPTI
+    for launch-overhead-free per-kernel time. Samples are collected in batches
+    because CUPTI reports spans only after a buffer flush; the criterion still
+    sees every individual sample.
 
-    Unlike :func:`bench_gpu_time` (which runs a *fixed* iteration count and
-    returns the raw list), this drives a **sequential sampling procedure**: run a
-    small batch of cold, L2-flushed, optionally throttle-screened iterations,
-    measure each one's pure GPU time with CUPTI, update running statistics, then
-    ask a swappable stopping criterion "have we seen enough?". Termination is
-    bounded below by a min-sample floor and above by a wall-clock ceiling, so
-    every reported number is the output of a convergence rule -- not "median of N
-    fixed runs". This is the timing methodology you want when the number gates a
-    CI regression or feeds an autotuner's reward.
-
-    Sampling proceeds in batches (``batch_size`` iterations) because CUPTI
-    collects activity records and reports per-iteration spans only after a buffer
-    flush; the criterion is therefore evaluated at batch boundaries (it still
-    sees every individual sample). Smaller batches converge sooner; larger
-    batches amortize CUPTI flush overhead.
+    Requires CUPTI (cupti-python >= 13); there is no CUDA-event fallback -- use
+    :func:`bench_gpu_time` for fixed-count timing without CUPTI. Single-device
+    only (no cross-rank aggregation), and heavier per sample than the fixed path
+    because each sample synchronizes to delimit its CUPTI window.
 
     Args:
-        fn (Callable): Kernel function to benchmark.
-        stopping_criterion (str): ``"stdrel"`` (default; converge relative stdev
-            to ``max_noise`` with noise-plateau + invalid-estimate fallbacks),
-            ``"entropy"`` (information-theoretic convergence), or
-            ``"sample-count"`` (deterministic ``target_samples``, for
-            reproducible CI). See :mod:`flashinfer.testing.statistics`.
-        max_noise (float): Target relative stdev for ``stdrel`` (default 0.005 =
-            0.5%, matching NVBench).
-        min_time_ms (float): Minimum *accumulated GPU* time before ``stdrel`` may
-            stop (default 500 ms = NVBench's 0.5 s lower bound).
-        max_time_ms (float): Wall-clock ceiling; the loop always terminates by
-            this (default 10 s).
-        min_samples (int): Hard floor on samples before any criterion can stop.
-        max_samples (int): Hard cap on samples (safety bound).
-        target_samples (int): Sample count for the ``sample-count`` criterion.
-        batch_size (int, optional): Iterations per CUPTI flush / criterion check
-            (default 16). Capped per batch so ``sample-count`` lands exactly on
-            ``target_samples`` and the run never exceeds ``max_samples``.
-        dry_run_iters (int, optional): Warmup iterations (not timed). If None,
-            derived from ``dry_run_time_ms`` and a 5-run estimate.
-        dry_run_time_ms (float): Target warmup duration in ms (default 25).
-        use_cuda_graph (bool): Capture ``fn`` into a CUDA graph and time its
-            replay (default False). CUPTI measures the replayed kernels.
-        throttle_screen (bool): If True, discard samples taken while the GPU SM
-            clock is throttled (below ``throttle_threshold`` of max), with a
-            growing cooldown. Requires NVML (already a FlashInfer dependency);
-            off by default since it adds per-sample host overhead.
-        throttle_threshold (float): Fraction of max SM clock below which a sample
-            is considered throttled (default 0.75).
-        throttle_cooldown_ms (float): Base post-throttle sleep; grows (capped at
-            500 ms) while throttling persists, mirroring NVBench.
-        max_consecutive_throttled (int): Give up screening after this many
-            back-to-back throttled samples (avoids an infinite discard loop).
-        input_args (tuple): Positional arguments to ``fn``.
-        input_kwargs (dict, optional): Keyword arguments to ``fn``.
-        cold_l2_cache (bool): Flush L2 before each sample (default True).
-        return_samples (bool): If True (default) return ``(samples, stats)``;
-            if False return just ``stats``.
+        fn: Kernel callable to benchmark.
+        stopping_criterion: ``"stdrel"``, ``"sample-count"``, or ``"entropy"``
+            (see :mod:`flashinfer.testing.statistics`).
+        max_noise: Target relative stdev for ``"stdrel"`` (default 0.5%).
+        min_time_ms: Minimum accumulated GPU time before ``"stdrel"`` may stop.
+        max_time_ms: Wall-clock ceiling for the whole loop.
+        min_samples: Lower bound on samples before any criterion may stop.
+        max_samples: Hard upper bound on samples.
+        target_samples: Sample count for the ``"sample-count"`` criterion.
+        batch_size: Samples per CUPTI flush / criterion check (default 16).
+        dry_run_iters: Warmup iterations; derived from ``dry_run_time_ms`` if None.
+        dry_run_time_ms: Target warmup duration in ms.
+        use_cuda_graph: Capture ``fn`` into a CUDA graph and time its replay.
+        throttle_screen: Discard samples taken while the SM clock is throttled.
+        throttle_threshold: Fraction of the max SM clock below which a sample is
+            considered throttled.
+        throttle_cooldown_ms: Base sleep after a throttled sample (grows, capped
+            at 500 ms, while throttling persists).
+        max_consecutive_throttled: Stop screening after this many throttled
+            samples in a row.
+        input_args: Positional arguments forwarded to ``fn``.
+        input_kwargs: Keyword arguments forwarded to ``fn``.
+        cold_l2_cache: Flush the L2 cache before each sample.
+        return_samples: Return ``(samples, stats)`` if True, else just ``stats``.
 
     Returns:
-        Tuple[List[float], BenchmarkStatistics] | BenchmarkStatistics:
-        the per-sample GPU times (ms) and/or their summary. ``stats.median`` is
-        the recommended central value; ``stats.noise`` is the coefficient of
-        variation; ``stats.relative_iqr`` is the robust analog.
+        ``(samples, stats)`` or ``stats``, where ``samples`` is the list of
+        per-sample GPU times (ms) and ``stats`` is a
+        :class:`~flashinfer.testing.statistics.BenchmarkStatistics`.
 
     Raises:
-        RuntimeError: if CUPTI (cupti-python >= 13) is unavailable.
-
-    Note:
-        Timing is single-device (no cross-rank aggregation). A
-        ``cudaDeviceSynchronize`` per iteration is required to delimit each
-        sample's CUPTI window, so this is heavier per sample than the batched
-        fixed-count path -- the cost of an adaptive procedure.
-
-    Example:
-        >>> samples, stats = bench_gpu_time_with_statistics(
-        ...     fn=run_kernel, input_args=(x, y, out),
-        ...     stopping_criterion="stdrel", throttle_screen=True,
-        ... )
-        >>> print(stats.summary_str())
+        RuntimeError: if cupti-python >= 13 is unavailable.
     """
     cupti = _import_cupti_or_raise()
 
