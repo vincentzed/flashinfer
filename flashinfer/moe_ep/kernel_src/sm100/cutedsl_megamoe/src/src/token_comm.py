@@ -1818,6 +1818,7 @@ class TokenInPullTokenBackPush:
                     prologue_grid_sync=True,
                     epilogue_grid_sync=True,
                 )
+            _iket.range_push("Tail_Drain_Barrier")
             self.nvlink_barrier(
                 token_comm_args.nvlink_barrier_signal,
                 token_comm_args.nvlink_barrier_counter,
@@ -1830,6 +1831,7 @@ class TokenInPullTokenBackPush:
                 prologue_grid_sync=True,
                 epilogue_grid_sync=True,
             )
+            _iket.range_pop()  # Tail_Drain_Barrier
             # Drain complete: every peer's combine STGs into this rank's
             # staging are visible.  Release the caller's fused tail-reduce
             # warps; the resets + publish barrier below run concurrently with
@@ -1848,6 +1850,7 @@ class TokenInPullTokenBackPush:
                 local_warp_idx=local_warp_idx,
                 lane_idx=lane_idx,
             )
+            _iket.range_push("Tail_Publish_Barrier")
             self.nvlink_barrier(
                 token_comm_args.nvlink_barrier_signal,
                 token_comm_args.nvlink_barrier_counter,
@@ -1860,6 +1863,7 @@ class TokenInPullTokenBackPush:
                 prologue_grid_sync=True,
                 epilogue_grid_sync=True,
             )
+            _iket.range_pop()  # Tail_Publish_Barrier
             # Local counters last: rank-local, and grid_sync/nvlink_barrier
             # counters above stay live until this final barrier completes.
             self.tail_reset_counters(
