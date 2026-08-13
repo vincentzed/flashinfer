@@ -331,6 +331,10 @@ class RMSNormFP4QuantKernel:
         if enable_pdl:
             cute.arch.griddepcontrol_wait()
 
+        # IKET instrumentation: whole-kernel range + setup phase
+        e2e_token = cute.experimental.iket.range_start("kernel_e2e")
+        cute.experimental.iket.range_push("setup")
+
         H = self.H
         block_size = self.block_size
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
@@ -443,15 +447,19 @@ class RMSNormFP4QuantKernel:
         # ==================================================================
         # Phase 1: Async copy global → shared (for sum-of-squares)
         # ==================================================================
+        cute.experimental.iket.range_pop()  # setup
+        cute.experimental.iket.range_push("g2s_load")
         if row_in_bounds:
             cute.copy(copy_atom_load_async, tXgX, tXsX, pred=tXpX)
 
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
+        cute.experimental.iket.range_pop()  # g2s_load
 
         # ==================================================================
         # Phase 2: Compute sum of squares with cluster reduction
         # ==================================================================
+        cute.experimental.iket.range_push("sumsq_reduce")
         cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(Float32)
 
@@ -470,17 +478,20 @@ class RMSNormFP4QuantKernel:
         # rstd = 1 / sqrt(mean(x²) + eps)
         mean_sq = sum_sq / H  # Use full H, not H_per_cta
         rstd = cute.math.rsqrt(mean_sq + eps, fastmath=True)
+        cute.experimental.iket.range_pop()  # sumsq_reduce
 
         # Read global_scale from device memory (CUDA graph compatible)
         # Note: global_scale is incorporated into the block scale, NOT applied to input
         global_scale_val = mGlobalScale[0]
 
         # Sync after reduction
+        cute.experimental.iket.range_push("post_sync")
         if cutlass.const_expr(cluster_n > 1):
             cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()
         else:
             cute.arch.barrier()
+        cute.experimental.iket.range_pop()  # post_sync
 
         # ==================================================================
         # Phase 3: RMSNorm + Quantize with Vectorized Global Loads
@@ -488,6 +499,7 @@ class RMSNormFP4QuantKernel:
         # Get actual row index
         actual_row_idx = bidx * rows_per_block + row_in_block
 
+        cute.experimental.iket.range_push("quant_store")
         if actual_row_idx < M:
             # Process SF blocks assigned to this thread
             num_sf_per_thread = (
@@ -651,6 +663,9 @@ class RMSNormFP4QuantKernel:
                             mY, actual_row_idx * (H // 2) + out_offset
                         )
                         st_global_u64(out_ptr, packed64_c1)
+
+        cute.experimental.iket.range_pop()  # quant_store
+        cute.experimental.iket.range_end(e2e_token)
 
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()

@@ -901,6 +901,7 @@ class _SharedOnlyPublishDeviceKernel:
         tidx, _, _ = cute.arch.thread_idx()
         token = block // self.ctas_per_token
         fragment_base = (block % self.ctas_per_token) * self.fragments_per_cta + tidx
+        cute.experimental.iket.mark("bt_publish")
 
         inputs = cute.make_rmem_tensor(
             cute.make_layout(
@@ -1047,11 +1048,13 @@ class _OwnerReduceMulticastDeviceKernel:
             cute.arch.griddepcontrol_wait()
 
         stage = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
+        cute.experimental.iket.mark("bt_reduce")
         rank_values = cute.make_rmem_tensor(
             cute.make_layout((self.tp_size, 4)),
             Uint32,
         )
         rank_values.fill(Uint32(0))
+        cute.experimental.iket.range_push("bt_spin_reduce")
         dirty = active
         while dirty:
             dirty = False
@@ -1070,6 +1073,7 @@ class _OwnerReduceMulticastDeviceKernel:
                 dirty = dirty | fragment_has_negative_zero(packed)
                 for word in cutlass.range_constexpr(4):
                     rank_values[source_rank, word] = packed[word]
+        cute.experimental.iket.range_pop()  # bt_spin_reduce
         if active:
             reduced = cute.make_rmem_tensor(
                 cute.make_layout((VEC_BF16,)),
@@ -1173,6 +1177,7 @@ class _MaterializeRMSNormDeviceKernel:
         gamma: cute.Tensor,
         stage_state: cute.Tensor,
     ) -> None:
+        cute.experimental.iket.mark("bt_rms")
         tidx, _, _ = cute.arch.thread_idx()
         token, _, _ = cute.arch.block_idx()
 

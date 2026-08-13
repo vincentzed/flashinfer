@@ -380,6 +380,7 @@ class _QuadFinalizePublishDeviceKernel:
         token = block // self.ctas_per_token
         cta_in_token = block % self.ctas_per_token
         fragment = cta_in_token * self.threads + tidx
+        cute.experimental.iket.mark("ll_publish")
 
         smem = cutlass.utils.SmemAllocator()
         staged_indices = smem.allocate_array(Int32, self.top_k)
@@ -607,6 +608,7 @@ class _SharedOnlyPublishDeviceKernel:
         token = block // self.ctas_per_token
         cta_in_token = block % self.ctas_per_token
         fragment = cta_in_token * self.threads + tidx
+        cute.experimental.iket.mark("ll_publish")
 
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_wait()
@@ -801,6 +803,10 @@ class _LamportResidualRMSNormDeviceKernel:
         group = tidx // self.rank_lanes
         base_fragment = cluster_rank * self.groups_per_cta + group
 
+        # IKET instrumentation
+        ll_e2e = cute.experimental.iket.range_start("ll_lamport_e2e")
+        cute.experimental.iket.range_push("ll_preload")
+
         prenorm_fragments = cute.make_rmem_tensor(
             cute.make_layout(
                 (self.trips, VEC_BF16),
@@ -852,9 +858,13 @@ class _LamportResidualRMSNormDeviceKernel:
                         packed_u32x4_to_bf16x8(load_global_u32x4(residual_pointer))
                     )
 
+        cute.experimental.iket.range_pop()  # ll_preload
+        cute.experimental.iket.range_push("ll_pdl_wait")
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_wait()
+        cute.experimental.iket.range_pop()  # ll_pdl_wait
 
+        cute.experimental.iket.range_push("ll_spin_reduce")
         active_stage = load_volatile_u32(stage_state.iterator + ACTIVE_STAGE)
         for trip in cutlass.range_constexpr(self.trips):
             fragment = base_fragment + trip * self.fragment_stride
@@ -926,6 +936,8 @@ class _LamportResidualRMSNormDeviceKernel:
                         bf16x8_to_packed_u32x4(prenorm_bf16),
                     )
 
+        cute.experimental.iket.range_pop()  # ll_spin_reduce
+
         if token == 0 and cluster_rank == 0 and tidx == 0:
             store_global_u32(
                 stage_state.iterator + NEXT_STAGE,
@@ -934,6 +946,7 @@ class _LamportResidualRMSNormDeviceKernel:
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_launch_dependents()
 
+        cute.experimental.iket.range_push("ll_sentinel_clear")
         for trip in cutlass.range_constexpr(self.trips):
             fragment = base_fragment + trip * self.fragment_stride
             for wave in cutlass.range_constexpr(self.rank_waves):
@@ -947,7 +960,9 @@ class _LamportResidualRMSNormDeviceKernel:
                     store_lamport_sentinel_u32x4(
                         Int64((contribution_mailbox.iterator + source_element).toint())
                     )
+        cute.experimental.iket.range_pop()  # ll_sentinel_clear
 
+        cute.experimental.iket.range_push("ll_rms_reduce")
         thread_sum = Float32(0.0)
         for trip in cutlass.range_constexpr(self.trips):
             fragment = base_fragment + trip * self.fragment_stride
@@ -985,6 +1000,9 @@ class _LamportResidualRMSNormDeviceKernel:
             full_sum / Float32(self.hidden) + Float32(self.rms_epsilon),
             fastmath=True,
         )
+        cute.experimental.iket.range_pop()  # ll_rms_reduce
+
+        cute.experimental.iket.range_push("ll_norm_store")
         for trip in cutlass.range_constexpr(self.trips):
             fragment = base_fragment + trip * self.fragment_stride
             if fragment < self.fragments and rank_lane == 0:
@@ -1001,3 +1019,5 @@ class _LamportResidualRMSNormDeviceKernel:
                     Int64((norm_output.iterator + output_element).toint()),
                     bf16x8_to_packed_u32x4(result),
                 )
+        cute.experimental.iket.range_pop()  # ll_norm_store
+        cute.experimental.iket.range_end(ll_e2e)

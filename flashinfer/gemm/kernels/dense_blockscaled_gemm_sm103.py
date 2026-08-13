@@ -611,6 +611,10 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
+        # IKET instrumentation: per-warp lifetime + common prologue
+        e2e_token = cute.experimental.iket.range_start("kernel_e2e")
+        cute.experimental.iket.range_push("prologue")
+
         #
         # Prefetch tma desc
         #
@@ -913,6 +917,8 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         )
         work_tile = tile_sched.initial_work_tile_info()
 
+        cute.experimental.iket.range_pop()  # prologue
+
         #
         # Specialized TMA load warp for A/B tensors
         #
@@ -921,8 +927,10 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
             # Persistent tile scheduling loop for AB loads
             #
             buffers_per_k_tile = 3
+            cute.experimental.iket.range_push("tma_main")
 
             while work_tile.is_valid_tile:
+                cute.experimental.iket.range_push("tma_tile")
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
@@ -964,6 +972,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                 # TMA load loop for A/B tensors
                 #
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    cute.experimental.iket.range_push("tma_k_tile", k_tile)
                     # Load buffers_per_k_tile buffers
                     for buffer in cutlass.range(buffers_per_k_tile, unroll_full=True):
                         # Acquire next empty AB buffer
@@ -998,12 +1007,16 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                         ):
                             peek_ab_empty_status = ab_producer.try_acquire()
 
+                    cute.experimental.iket.range_pop()  # tma_k_tile
+
                 # Advance to next tile
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+                cute.experimental.iket.range_pop()  # tma_tile
 
             # Signal end of AB loads
             ab_producer.tail()
+            cute.experimental.iket.range_pop()  # tma_main
 
         #
         # Specialized TMA load warp for scale factor tensors
@@ -1012,7 +1025,9 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
             #
             # Persistent tile scheduling loop for SF loads
             #
+            cute.experimental.iket.range_push("sf_main")
             while work_tile.is_valid_tile:
+                cute.experimental.iket.range_push("sf_tile")
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
@@ -1040,6 +1055,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                 # TMA load loop for scale factors
                 #
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    cute.experimental.iket.range_push("sf_k_tile", k_tile)
                     # Load SF stages based on sf_buffers_per_tile_k
                     for sf_stage in cutlass.range(
                         self.sf_buffers_per_tile_k, unroll_full=True
@@ -1083,12 +1099,16 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                         ):
                             peek_sf_empty_status = sf_producer.try_acquire()
 
+                    cute.experimental.iket.range_pop()  # sf_k_tile
+
                 # Advance to next tile
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+                cute.experimental.iket.range_pop()  # sf_tile
 
             # Signal end of SF loads
             sf_producer.tail()
+            cute.experimental.iket.range_pop()  # sf_main
 
         #
         # Specialized MMA warp
@@ -1186,7 +1206,9 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
             MmasPerSfBuffer = 8 // self.sf_buffers_per_tile_k
             sf_stride = 6 if self.sf_vec_size == 16 else 3
 
+            cute.experimental.iket.range_push("mma_main")
             while work_tile.is_valid_tile:
+                cute.experimental.iket.range_push("mma_tile")
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
@@ -1218,6 +1240,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                 is_first_iteration = True
 
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    cute.experimental.iket.range_push("mma_k_tile", k_tile)
                     if is_leader_cta:
                         # Conditionally load SFA/SFB for MMA0/MMA1 depending on sf_vec_size
                         if 0 % MmasPerSfBuffer == 0:
@@ -1511,6 +1534,8 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
 
                         ab_full2.release()
 
+                    cute.experimental.iket.range_pop()  # mma_k_tile
+
                 if is_leader_cta:
                     acc_pipeline.producer_commit(acc_producer_state)
                 acc_producer_state.advance()
@@ -1520,11 +1545,13 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+                cute.experimental.iket.range_pop()  # mma_tile
 
             #
             # Wait for accumulator buffer empty
             #
             acc_pipeline.producer_tail(acc_producer_state)
+            cute.experimental.iket.range_pop()  # mma_main
 
         sC = None
         if cutlass.const_expr(self.use_tma_store):
@@ -1574,7 +1601,9 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                 )
             # Wrap epilogue_op with alpha scaling
             alpha_epilogue_op = lambda x: epilogue_op(alpha_value * x)
+            cute.experimental.iket.range_push("epi_main")
             while work_tile.is_valid_tile:
+                cute.experimental.iket.range_push("epi_tile")
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
@@ -1619,7 +1648,9 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                         tCcC_base=tCcC,
                         mC_mnl=mC_mnl,
                     )
+                cute.experimental.iket.range_pop()  # epi_tile
 
+            cute.experimental.iket.range_pop()  # epi_main
             if cutlass.const_expr(self.use_tma_store):
                 # Wait for C store complete
                 c_pipeline.producer_tail()
@@ -1635,6 +1666,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
 
             cute.arch.mbarrier_init_fence()
 
+        cute.experimental.iket.range_end(e2e_token)
         griddepcontrol_launch_dependents()
 
     @staticmethod

@@ -308,6 +308,7 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
         cta_slot = block % self.tp
         wave = Int64(cta_group)
         token = wave * self.tp + cta_slot
+        cute.experimental.iket.mark("ht_main")
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         rows = storage.rows.get_tensor(smem_layout)

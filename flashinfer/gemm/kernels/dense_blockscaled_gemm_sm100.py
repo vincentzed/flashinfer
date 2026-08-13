@@ -501,6 +501,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
+        # IKET instrumentation: per-warp lifetime + common prologue
+        e2e_token = cute.experimental.iket.range_start("kernel_e2e")
+        cute.experimental.iket.range_push("prologue")
+
         #
         # Prefetch tma desc
         #
@@ -783,6 +787,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         #
         # Specialized TMA load warp
         #
+        cute.experimental.iket.range_pop()  # prologue
+
         if warp_idx == self.tma_warp_id:
             #
             # Persistent tile scheduling loop
@@ -796,7 +802,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
 
+            cute.experimental.iket.range_push("tma_main")
             while work_tile.is_valid_tile:
+                cute.experimental.iket.range_push("tma_tile")
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
@@ -861,11 +869,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 #
                 for k_block in cutlass.range(0, k_block_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
+                    cute.experimental.iket.range_push("tma_acquire")
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
                     )
+                    cute.experimental.iket.range_pop()  # tma_acquire
 
                     # TMA load A/B/SFA/SFB
+                    issue_token = cute.experimental.iket.range_start("tma_issue")
                     cute.copy(
                         tma_atom_a,
                         tAgA_slice[(None, ab_producer_state.count)],
@@ -894,6 +905,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfb_full_mcast_mask,
                     )
+                    cute.experimental.iket.range_end(issue_token)
 
                     # Prefetch: Rolling prefetch for next tiles
                     if cutlass.const_expr(self.use_prefetch):
@@ -932,11 +944,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+                cute.experimental.iket.range_pop()  # tma_tile
 
             #
             # Wait A/B buffer empty
             #
             ab_pipeline.producer_tail(ab_producer_state)
+            cute.experimental.iket.range_pop()  # tma_main
 
         #
         # Specialized MMA warp
@@ -1015,7 +1029,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 pipeline.PipelineUserType.Producer, self.num_acc_stage
             )
 
+            cute.experimental.iket.range_push("mma_main")
             while work_tile.is_valid_tile:
+                cute.experimental.iket.range_push("mma_tile")
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
@@ -1045,7 +1061,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 # Wait for accumulator buffer empty
                 #
                 if is_leader_cta:
+                    cute.experimental.iket.range_push("mma_acc_acquire")
                     acc_pipeline.producer_acquire(acc_producer_state)
+                    cute.experimental.iket.range_pop()  # mma_acc_acquire
 
                 tCtSFB_mma = tCtSFB
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
@@ -1086,9 +1104,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 for _k_block in range(k_block_cnt):
                     if is_leader_cta:
                         # Conditionally wait for AB buffer full
+                        cute.experimental.iket.range_push("mma_ab_wait")
                         ab_pipeline.consumer_wait(
                             ab_consumer_state, peek_ab_full_status
                         )
+                        cute.experimental.iket.range_pop()  # mma_ab_wait
 
                         #  Copy SFA/SFB from smem to tmem
                         s2t_stage_coord = (
@@ -1167,11 +1187,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+                cute.experimental.iket.range_pop()  # mma_tile
 
             #
             # Wait for accumulator buffer empty
             #
             acc_pipeline.producer_tail(acc_producer_state)
+            cute.experimental.iket.range_pop()  # mma_main
         #
         # Specialized epilogue warps
         #
@@ -1248,7 +1270,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 producer_group=c_producer_group,
             )
 
+            cute.experimental.iket.range_push("epi_main")
             while work_tile.is_valid_tile:
+                cute.experimental.iket.range_push("epi_tile")
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
@@ -1289,7 +1313,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 #
                 # Wait for accumulator buffer full
                 #
+                cute.experimental.iket.range_push("epi_acc_wait")
                 acc_pipeline.consumer_wait(acc_consumer_state)
+                cute.experimental.iket.range_pop()  # epi_acc_wait
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
@@ -1384,7 +1410,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+                cute.experimental.iket.range_pop()  # epi_tile
 
+            cute.experimental.iket.range_pop()  # epi_main
             #
             # Dealloc the tensor memory buffer
             #
@@ -1408,6 +1436,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             #
             c_pipeline.producer_tail()
 
+        cute.experimental.iket.range_end(e2e_token)
         griddepcontrol_launch_dependents()
 
     @staticmethod

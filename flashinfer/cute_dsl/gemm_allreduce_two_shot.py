@@ -1337,6 +1337,7 @@ class PersistentDenseGemmKernel:
                         + cute.arch.block_idx_in_cluster()
                     )
                     if warp_idx == self.epilog_warp_id[0]:
+                        cute.experimental.iket.range_push("epi_ar_arrive")
                         cute.arch.cp_async_bulk_wait_group(0, read=False)
                         # System barrier to make sure that data from each GPU is in memory before allreduce
                         with cute.arch.elect_one():
@@ -1344,6 +1345,7 @@ class PersistentDenseGemmKernel:
                             cute.arch.fence_acq_rel_gpu()
                             spin_lock_multimem_arrive(flag)
                             cute.arch.fence_proxy("alias")
+                        cute.experimental.iket.range_pop()  # epi_ar_arrive
 
                 #
                 # Advance to next tile
@@ -1393,6 +1395,8 @@ class PersistentDenseGemmKernel:
                 )
                 work_tile = tile_sched.initial_work_tile_info()
 
+                cute.experimental.iket.range_push("ar_main")
+
                 # we want 128bit ld/st for better performance
                 atom_val = 128 // c_mc.element_type.width
                 atom_thr_n = self.mma_tiler[1] // atom_val
@@ -1427,19 +1431,24 @@ class PersistentDenseGemmKernel:
                         cur_tile_coord[2],
                     )
 
+                    cute.experimental.iket.range_push("ar_tile", tile_id)
                     # System barrier to make sure that data from each GPU is in memory before allreduce
                     if warp_idx == self.all_reduce_warp_id[0]:
+                        cute.experimental.iket.range_push("ar_flag_wait", tile_id)
                         with cute.arch.elect_one():
                             flag = barrier_flag.iterator + tile_id
                             # TODO: we may use LDG+STG for spin lock instead of ATOMIC_CAS for better performance.
                             distributed.spin_lock_atom_cas_relaxed_wait(
                                 flag, expected_val=num_ranks, reset_val=0, scope="gpu"
                             )
+                        cute.experimental.iket.range_pop()  # ar_flag_wait
 
+                    cute.experimental.iket.range_push("ar_bar_sync")
                     cute.arch.barrier(
                         barrier_id=self.all_reduce_sync_bar_id,
                         number_of_threads=32 * len(self.all_reduce_warp_id),
                     )
+                    cute.experimental.iket.range_pop()  # ar_bar_sync
                     # partition and slice at tile level
                     gC_mc = cute.local_tile(
                         c_mc,
@@ -1464,6 +1473,7 @@ class PersistentDenseGemmKernel:
                     # partition at thread level
                     frgC_mc = thr_copy_fake.partition_S(tCgC_mc_local_rank)
                     atom, loop_m, loop_n = frgC_mc.shape
+                    cute.experimental.iket.range_push("ar_ldst")
                     for i in cutlass.range_constexpr(loop_m):
                         for j in cutlass.range_constexpr(loop_n):
                             mc_ptr = frgC_mc[None, i, j].iterator
@@ -1489,10 +1499,13 @@ class PersistentDenseGemmKernel:
                                     mc_ptr
                                 )
                             distributed.multimem_st_4xb32(mc_ptr, x, y, z, w)
+                    cute.experimental.iket.range_pop()  # ar_ldst
                     # Advance to next tile
                     tile_sched.advance_to_next_work()
                     work_tile = tile_sched.get_current_work()
+                    cute.experimental.iket.range_pop()  # ar_tile
 
+                cute.experimental.iket.range_push("ar_final_bar")
                 cute.arch.barrier(
                     barrier_id=self.all_reduce_sync_bar_id,
                     number_of_threads=32 * len(self.all_reduce_warp_id),
@@ -1508,6 +1521,8 @@ class PersistentDenseGemmKernel:
                             barrier_flag_mc.iterator + last_flag_idx,
                             self.num_ranks,
                         )
+                cute.experimental.iket.range_pop()  # ar_final_bar
+                cute.experimental.iket.range_pop()  # ar_main
 
     def epilog_tmem_copy_and_partition(
         self,
