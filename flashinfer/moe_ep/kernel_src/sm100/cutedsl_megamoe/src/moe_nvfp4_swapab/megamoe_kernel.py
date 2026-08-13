@@ -1709,41 +1709,71 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         )
         one_pair = (cutlass.Float32(1.0), cutlass.Float32(1.0))
 
+        # Two units in flight per iteration (UNROLL=2): the epi warps hold the
+        # 256-reg budget, so 2*K independent LDG.128 per thread hide the DRAM
+        # latency the single-unit loop exposed (measured 4.6us -> parallelism
+        # bound at ~2.4 TB/s).  Per-element accumulation order is untouched
+        # (units are element-disjoint) -- still bitexact vs TopkReduce.
+        UNROLL: cutlass.Constexpr[int] = 2
+
         while worker < total:
-            token_idx = worker // cutlass.Int32(hidden_tiles)
-            hidden_tile_idx = worker % cutlass.Int32(hidden_tiles)
-            terms = cute.zipped_divide(
-                combine_output[token_idx, None, None],
-                (num_topk, hidden_per_thread),
-            )[(None, None), (0, hidden_tile_idx)]
-            dst = cute.zipped_divide(
-                reduced_output[token_idx, None],
-                (hidden_per_thread,),
-            )[(None,), (hidden_tile_idx,)]
+            unit_workers = [worker + u * stride for u in range(UNROLL)]
+            term_lists = [
+                [
+                    cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
+                    for _ in range(num_topk)
+                ]
+                for _ in range(UNROLL)
+            ]
+            dsts = []
+            valids = []
+            for u in cutlass.range_constexpr(UNROLL):
+                w = unit_workers[u]
+                valid = w < total
+                valids.append(valid)
+                token_idx = w // cutlass.Int32(hidden_tiles)
+                hidden_tile_idx = w % cutlass.Int32(hidden_tiles)
+                terms = cute.zipped_divide(
+                    combine_output[token_idx, None, None],
+                    (num_topk, hidden_per_thread),
+                )[(None, None), (0, hidden_tile_idx)]
+                dsts.append(
+                    cute.zipped_divide(
+                        reduced_output[token_idx, None],
+                        (hidden_per_thread,),
+                    )[(None,), (hidden_tile_idx,)]
+                )
+                if valid:
+                    for k in cutlass.range_constexpr(0, num_topk, 1):
+                        cute.copy(load_atom, terms[k, None], term_lists[u][k])
 
-            acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
-            for k in cutlass.range_constexpr(0, num_topk, 1):
-                term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
-                cute.copy(load_atom, terms[k, None], term)
-                for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
-                    value_pair = (
-                        cutlass.Float32(term[i]),
-                        cutlass.Float32(term[i + 1]),
+            for u in cutlass.range_constexpr(UNROLL):
+                if valids[u]:
+                    acc = cute.make_rmem_tensor(
+                        (hidden_per_thread,), cutlass.Float32
                     )
-                    if cutlass.const_expr(k != 0):
-                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
-                            value_pair, one_pair, (acc[i], acc[i + 1])
-                        )
-                    else:
-                        acc[i] = value_pair[0]
-                        acc[i + 1] = value_pair[1]
+                    for k in cutlass.range_constexpr(0, num_topk, 1):
+                        for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                            value_pair = (
+                                cutlass.Float32(term_lists[u][k][i]),
+                                cutlass.Float32(term_lists[u][k][i + 1]),
+                            )
+                            if cutlass.const_expr(k != 0):
+                                acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
+                                    value_pair, one_pair, (acc[i], acc[i + 1])
+                                )
+                            else:
+                                acc[i] = value_pair[0]
+                                acc[i + 1] = value_pair[1]
 
-            out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
-            out.store(acc.load().to(out_dtype))
-            p = dst.iterator
-            dst_aligned = cute.make_tensor(
-                cute.make_ptr(p.dtype, p.toint(), p.memspace, assumed_align=16),
-                dst.layout,
-            )
-            cute.copy(store_atom, out, dst_aligned)
-            worker = worker + stride
+                    out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
+                    out.store(acc.load().to(out_dtype))
+                    p = dsts[u].iterator
+                    dst_aligned = cute.make_tensor(
+                        cute.make_ptr(
+                            p.dtype, p.toint(), p.memspace, assumed_align=16
+                        ),
+                        dsts[u].layout,
+                    )
+                    cute.copy(store_atom, out, dst_aligned)
+            worker = worker + cutlass.Int32(UNROLL) * stride
