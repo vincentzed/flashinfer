@@ -82,12 +82,20 @@ PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
 # ``token_back_mode``: ``epi_warps`` wins at small batch but falls off a cliff
 # mid-range (+18% at 512 tokens, +35% at 1024 -- every dispatch-warp candidate
 # beat every epi_warps candidate there); tile/flag_batch are second-order.
-_SMALL_TOKEN_KNOBS: Dict[str, Any] = {  # < 512 tokens (winner at 8)
-    "mma_tiler_mnk": (256, 128, 256),
+_SMALL_TOKEN_KNOBS: Dict[str, Any] = {  # < 512 tokens
+    # Token tile N 128 -> 64 and epi_flag_batch (2,4) -> (1,2): measured on
+    # 8x B300 EP8 at DeepSeek-V4-Pro geometry (hidden 7168, inter 3072,
+    # 384 experts, top-k 6): -1.8% at 128 tok/rank, -1.2% at 64 tok/rank,
+    # bit-identical output (torch.equal) vs the previous profile.  Decode
+    # batches leave ~16 tokens per expert, so the 128-wide token tile was
+    # ~7/8 padding in the epilogue/combine path; IKET phase traces show the
+    # win is entirely fc1_epi/fc2_epi work (weight-TMA spans unchanged).
+    # Previous (GB200-derived, winner at 8): (256, 128, 256) + (2, 4).
+    "mma_tiler_mnk": (256, 64, 256),
     "cluster_shape_mnk": (2, 1, 1),
     "group_hint": 512,
     "flag_batch": 4,
-    "epi_flag_batch": (2, 4),
+    "epi_flag_batch": (1, 2),
     "token_back_mode": "epi_warps",
     "load_balance_mode": "atomic_counter",
 }
