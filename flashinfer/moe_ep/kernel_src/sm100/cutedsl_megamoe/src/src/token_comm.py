@@ -221,6 +221,7 @@ _MLIR_VALUE_FIELDS = (
     "shared_zero_prefix",
     "peer_rank_ptr_mapper",
     "local_rank",
+    "reduced_output",
 )
 
 _CONST_FIELDS = (
@@ -277,6 +278,7 @@ class TokenCommArgs:
         token_back_schedule_counter: cute.Pointer = None,
         combine_sf: cute.Tensor = None,
         fc2_output_sf: cute.Tensor = None,
+        reduced_output: cute.Tensor = None,
     ):
         self.input_token_buffer = input_token_buffer
         self.input_sf_buffer = input_sf_buffer
@@ -292,6 +294,7 @@ class TokenCommArgs:
         self.fc1_ready_counter = fc1_ready_counter
         self.token_src_metadata = token_src_metadata
         self.combine_output = combine_output
+        self.reduced_output = reduced_output
         self.combine_sf = combine_sf
         self.fc2_output_workspace = fc2_output_workspace
         self.fc2_output_sf = fc2_output_sf
@@ -1762,7 +1765,15 @@ class TokenInPullTokenBackPush:
         warp_idx,
         lane_idx,
         tidx,
+        fused_reduce_drain_bar_id: Optional[int] = None,
     ):
+        """``fused_reduce_drain_bar_id`` (constexpr): when set, the dispatch
+        warps arrive on that NamedBarrier right after the FIRST (drain) nvlink
+        barrier -- the point where all peer combine STGs into this rank's
+        staging are visible.  The caller parks its reduce warps on the same
+        barrier so the tail topk reduce can run concurrently with the shared
+        counter reset + publish barrier below (see
+        ``Sm100MegaMoEKernel.token_comm_hook_kernel_tail``)."""
         nb_kernel_tail = pipeline.NamedBarrier(
             barrier_id=self.kernel_tail_named_barrier_id,
             num_threads=self.kernel_tail_threads,
@@ -1819,6 +1830,15 @@ class TokenInPullTokenBackPush:
                 prologue_grid_sync=True,
                 epilogue_grid_sync=True,
             )
+            # Drain complete: every peer's combine STGs into this rank's
+            # staging are visible.  Release the caller's fused tail-reduce
+            # warps; the resets + publish barrier below run concurrently with
+            # the reduce (disjoint memory: counters vs combine staging).
+            if cutlass.const_expr(fused_reduce_drain_bar_id is not None):
+                pipeline.NamedBarrier(
+                    barrier_id=fused_reduce_drain_bar_id,
+                    num_threads=self.kernel_tail_threads,
+                ).arrive()
             # Shared counters between the barriers: the slot=0 barrier below
             # publishes these zeros cross-rank for a back-to-back MegaMoE relaunch.
             self.tail_reset_counters(

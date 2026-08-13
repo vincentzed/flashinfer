@@ -101,6 +101,7 @@ class MegaMoENvfp4Config:
     epi_flag_batch: Tuple[int, int] = (1, 1)
     non_ubulk_fc2_store: bool = True
     in_kernel_fc2_reduce: bool = False
+    tail_fused_reduce: bool = False
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
@@ -437,6 +438,7 @@ class MegaMoENvfp4Frontend:
             c.epi_flag_batch,
             c.non_ubulk_fc2_store,
             c.in_kernel_fc2_reduce,
+            c.tail_fused_reduce,
             c.token_back_mode,
             c.combine_dtype,
             c.apply_topk_in_fc1,
@@ -497,6 +499,7 @@ class MegaMoENvfp4Frontend:
             fc2_output_dtype=cutlass.BFloat16,
             non_ubulk_fc2_store=c.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
+            tail_fused_reduce=c.tail_fused_reduce,
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
             gate_up_clamp=self._gate_up_clamp,

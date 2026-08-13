@@ -36,6 +36,7 @@ from typing import Any, Dict, Iterator, Optional, Tuple
 
 CORRECTNESS_KNOBS: Dict[str, Tuple[Any, ...]] = {
     "in_kernel_fc2_reduce": (False, True),
+    "tail_fused_reduce": (False, True),
     "token_back_mode": ("epi_warps", "standalone_warps", "reuse_dispatch_warps"),
     "non_ubulk_fc2_store": (True, False),
     "load_balance_mode": ("static", "atomic_counter"),
@@ -218,6 +219,13 @@ def is_valid(knobs: Dict[str, Any], *, combine_format: str = "bf16") -> bool:
 
     # quantized combine uses the explicit topk-reduce path; no in-kernel REDG.
     if combine_quantized and in_kernel:
+        return False
+    # tail_fused_reduce: bf16 separate-reduce form with epi-warp token-back only
+    # (mirrors the Sm100MegaMoEKernel constructor validation).
+    tail_fused = knobs.get("tail_fused_reduce", False)
+    if tail_fused and (
+        in_kernel or combine_quantized or token_back_mode != "epi_warps"
+    ):
         return False
     # quantized combine wires are only wired for dispatch-warp token-back
     # (mirrors the NVFP4 config validation).

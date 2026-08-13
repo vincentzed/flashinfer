@@ -42,8 +42,14 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int64
+
+try:
+    from cutlass.cute import iket as _iket  # type: ignore
+except ImportError:  # pragma: no cover -- wheels without cute.iket
+    from src.iket_compat import iket as _iket
 
 from .kernel_fc12 import Sm100SwapABSwigluFp4Fc12Kernel
 from .topk_reduce import TopkReduce
@@ -195,6 +201,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         gate_up_clamp: Optional[float] = None,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         flag_batch: int = 1,
+        tail_fused_reduce: bool = False,
     ) -> None:
         # The combine wire format drives the fc2 epilogue encoder, token_comm
         # push, and the combine_quant/combine_sf workspace sizing. The dataflow
@@ -219,6 +226,38 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 f"{combine_format} combine requires non_ubulk_fc2_store=True "
                 "(the UBLK fc2 store path cannot scalar-dereference FP4)."
             )
+        # tail_fused_reduce: run the (bitexact-equivalent) topk reduce on the
+        # idle epilogue warps inside the kernel tail, after the drain nvlink
+        # barrier, replacing the separate TopkReduce launch.  v1 scope: the
+        # bf16 separate-reduce form with epi-warp token-back and fc1-side topk
+        # weighting (the B300 decode winner configuration).
+        if tail_fused_reduce:
+            if in_kernel_fc2_reduce:
+                raise ValueError(
+                    "tail_fused_reduce and in_kernel_fc2_reduce are mutually "
+                    "exclusive (nothing left to reduce under REDG combine)."
+                )
+            if combine_format.is_quantized:
+                raise ValueError(
+                    "tail_fused_reduce currently supports only the bf16 "
+                    f"combine format; got {combine_format}."
+                )
+            if token_back_mode != "epi_warps":
+                raise ValueError(
+                    "tail_fused_reduce requires token_back_mode='epi_warps' "
+                    "(the dispatch token-back modes recast combine staging to "
+                    f"u8); got {token_back_mode!r}."
+                )
+            if not apply_topk_in_fc1:
+                raise ValueError(
+                    "tail_fused_reduce requires apply_topk_in_fc1=True (the "
+                    "in-tail reduce is a plain fp32 K-sum; the post-fc2 "
+                    "weighting path is not wired)."
+                )
+        self.tail_fused_reduce = tail_fused_reduce
+        # NamedBarrier id for the drain->reduce handoff; 1-7 kernel, 8-10
+        # token_comm, 11 free (hardware limit 16).
+        self.tail_fused_drain_bar_id = 11
         if static_expert_shape is None:
             raise NotImplementedError(
                 "Sm100MegaMoEKernel currently requires "
@@ -941,6 +980,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             # MegaMoE-specific constexpr:
             f"_ep_{self.world_size}_topk_{self.num_topk}_maxtoken_{self.max_tokens_per_rank}"
             f"_flagbatch_{self.flag_batch}"
+            f"_tailred{int(self.tail_fused_reduce)}"
         )
 
     # -- AOT compile / load (TVM-FFI calling convention) ----------------------
@@ -1438,6 +1478,11 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             token_padding_block=self.token_padding_block,
             sf_padding_block=self.sf_padding_block,
             sm_count=sm_count,
+            reduced_output=(
+                output_activation
+                if cutlass.const_expr(self.tail_fused_reduce)
+                else None
+            ),
         )
 
         # C1 / C2 are tautological (token_padding_block == "block_m";
@@ -1492,7 +1537,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         # exits). Weighting follows the compute graph: deepgemm (apply_topk_in_fc1)
         # folded the routing weight into fc1 -> plain K-sum; transformers applies
         # topk_weights here.
-        if cutlass.const_expr(not self.in_kernel_fc2_reduce):
+        if cutlass.const_expr(
+            not self.in_kernel_fc2_reduce and not self.tail_fused_reduce
+        ):
             score = (
                 topk_weights if cutlass.const_expr(not self.apply_topk_in_fc1) else None
             )
@@ -1596,4 +1643,107 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             warp_idx=warp_idx,
             lane_idx=lane_idx,
             tidx=tidx,
+            fused_reduce_drain_bar_id=(
+                self.tail_fused_drain_bar_id if self.tail_fused_reduce else None
+            ),
         )
+        # Fused tail topk reduce: the drain nvlink barrier inside kernel_tail
+        # (arrived on bar 11 by the dispatch warps) guarantees every peer's
+        # combine STGs into this rank's staging are visible -- the exact
+        # precondition the separate TopkReduce launch relies on today.  The
+        # epilogue warps (idle from the rendezvous onward) then run the same
+        # per-element fp32 K-ascending reduce TopkReduce runs, concurrently
+        # with the dispatch warps' counter resets + publish barrier.
+        if cutlass.const_expr(self.tail_fused_reduce):
+            nb_drain = pipeline.NamedBarrier(
+                barrier_id=self.tail_fused_drain_bar_id,
+                num_threads=self.token_comm.kernel_tail_threads,
+            )
+            if warp_idx < self.epilogue_warp_id[-1] + 1:
+                nb_drain.arrive_and_wait()
+                _iket.range_push("Tail_Fused_Reduce")
+                self._tail_fused_topk_reduce(token_comm_args, tidx)
+                _iket.range_pop()
+            elif warp_idx < self.dispatch_warp_id[0]:
+                # mma / tma_a / tma_b / sched warps: arrive-only, then exit.
+                nb_drain.arrive()
+            # dispatch warps already arrived inside kernel_tail (post-drain).
+
+    @cute.jit
+    def _tail_fused_topk_reduce(self, token_comm_args, tidx):
+        """Epi-warp tail reduce: collapse (token, topk, hidden) bf16 staging
+        into (token, hidden) bf16 output.
+
+        Bit-equivalent to ``TopkReduce._reduce_bf16`` with ``topk_score=None``:
+        identical 128-bit bf16 loads, identical per-element fp32 accumulation
+        order (k ascending; k=0 assign, k>0 fma with 1.0), identical bf16
+        down-convert and 128-bit store.  Only the worker->(token, hidden_tile)
+        partition differs, which is invisible per element.
+        """
+        combine_output = token_comm_args.combine_output  # (T, K, hidden) bf16
+        reduced_output = token_comm_args.reduced_output  # (n, hidden) bf16
+        hidden_per_thread: cutlass.Constexpr[int] = 8
+        hidden_tiles: cutlass.Constexpr[int] = self.hidden // hidden_per_thread
+        num_topk: cutlass.Constexpr[int] = self.num_topk
+        out_dtype = reduced_output.element_type
+
+        bidx, bidy, bidz = cute.arch.block_idx()
+        cta_linear_id = (
+            cutlass.Int32(bidx)
+            + cutlass.Int32(self.cluster_shape_mn[1]) * cutlass.Int32(bidy)
+            + cutlass.Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0])
+            * cutlass.Int32(bidz)
+        )
+        epi_threads = cutlass.Int32(len(self.epilogue_warp_id) * 32)
+        worker = cta_linear_id * epi_threads + tidx
+        stride = cutlass.Int32(token_comm_args.sm_count) * epi_threads
+        total = cutlass.Int32(reduced_output.shape[0]) * cutlass.Int32(hidden_tiles)
+
+        load_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            cutlass.BFloat16,
+            num_bits_per_copy=128,
+        )
+        store_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=128
+        )
+        one_pair = (cutlass.Float32(1.0), cutlass.Float32(1.0))
+
+        while worker < total:
+            token_idx = worker // cutlass.Int32(hidden_tiles)
+            hidden_tile_idx = worker % cutlass.Int32(hidden_tiles)
+            terms = cute.zipped_divide(
+                combine_output[token_idx, None, None],
+                (num_topk, hidden_per_thread),
+            )[(None, None), (0, hidden_tile_idx)]
+            dst = cute.zipped_divide(
+                reduced_output[token_idx, None],
+                (hidden_per_thread,),
+            )[(None,), (hidden_tile_idx,)]
+
+            acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+            for k in cutlass.range_constexpr(0, num_topk, 1):
+                term = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
+                cute.copy(load_atom, terms[k, None], term)
+                for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                    value_pair = (
+                        cutlass.Float32(term[i]),
+                        cutlass.Float32(term[i + 1]),
+                    )
+                    if cutlass.const_expr(k != 0):
+                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
+                            value_pair, one_pair, (acc[i], acc[i + 1])
+                        )
+                    else:
+                        acc[i] = value_pair[0]
+                        acc[i + 1] = value_pair[1]
+
+            out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
+            out.store(acc.load().to(out_dtype))
+            p = dst.iterator
+            dst_aligned = cute.make_tensor(
+                cute.make_ptr(p.dtype, p.toint(), p.memspace, assumed_align=16),
+                dst.layout,
+            )
+            cute.copy(store_atom, out, dst_aligned)
+            worker = worker + stride
