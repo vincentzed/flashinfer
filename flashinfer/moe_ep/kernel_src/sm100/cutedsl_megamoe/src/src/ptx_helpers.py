@@ -257,6 +257,29 @@ def stg_b64_raw(addr: Int64, val: Int64, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def bulk_prefetch_l2_raw(addr: Int64, num_bytes: Int32, *, loc=None, ip=None) -> None:
+    """``cp.async.bulk.prefetch.L2.global`` via raw int64 byte address.
+
+    One instruction hands the whole [addr, addr+num_bytes) range to the async
+    proxy for L2 prefetch (PTX ISA 8.0+, sm_90+).  addr must be 16B aligned and
+    num_bytes a multiple of 16.  Pure hint: no completion tracking, no mbar,
+    numerics-neutral.  Used by the MegaMoE head-start weight prefetch
+    (head_weight_prefetch_kb knob) to stream fc1 expert weights toward L2
+    during the dispatch_barrier head while DRAM is otherwise idle.
+    """
+    llvm.inline_asm(
+        None,
+        [addr.ir_value(loc=loc, ip=ip), num_bytes.ir_value(loc=loc, ip=ip)],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def stg_e8m0_from_f32(addr: Int64, fp32_val: Float32, *, loc=None, ip=None) -> None:
     """Convert ``fp32_val`` to E8M0 via PTX and store the 1-byte result to global memory.
 

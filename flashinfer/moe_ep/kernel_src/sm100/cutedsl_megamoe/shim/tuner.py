@@ -69,6 +69,9 @@ PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
         (4, 8),
         (16, 16),
     ),
+    # Head-start fc1 weight L2 prefetch budget per CTA in KB (0 = off).
+    # 512 KB x 148 CTAs ~= 74 MB coverage of the pool front.
+    "head_weight_prefetch_kb": (0, 256, 512, 1024),
 }
 
 

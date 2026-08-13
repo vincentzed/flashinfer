@@ -102,6 +102,9 @@ class MegaMoENvfp4Config:
     non_ubulk_fc2_store: bool = True
     in_kernel_fc2_reduce: bool = False
     tail_fused_reduce: bool = False
+    # Head-start fc1 weight L2 prefetch budget per CTA (KB, multiple of 16;
+    # 0 = off).  See kernel_fc12.py epilogue-branch comment.
+    head_weight_prefetch_kb: int = 0
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
@@ -439,6 +442,7 @@ class MegaMoENvfp4Frontend:
             c.non_ubulk_fc2_store,
             c.in_kernel_fc2_reduce,
             c.tail_fused_reduce,
+            c.head_weight_prefetch_kb,
             c.token_back_mode,
             c.combine_dtype,
             c.apply_topk_in_fc1,
@@ -500,6 +504,7 @@ class MegaMoENvfp4Frontend:
             non_ubulk_fc2_store=c.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
             tail_fused_reduce=c.tail_fused_reduce,
+            head_weight_prefetch_kb=c.head_weight_prefetch_kb,
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
             gate_up_clamp=self._gate_up_clamp,

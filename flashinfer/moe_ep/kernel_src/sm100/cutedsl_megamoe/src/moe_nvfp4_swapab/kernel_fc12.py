@@ -40,6 +40,7 @@ from common.megamoe_constants import (
 from .moe_utils import spin_wait
 from . import dynamic_mainloop
 from src.token_comm import CombineFormat
+from src import ptx_helpers
 
 
 # token_comm_args is an opaque subclass-owned bundle.  The base only forwards it
@@ -90,6 +91,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
+        head_weight_prefetch_kb: int = 0,
     ) -> None:
         if not force_static_sched:
             raise NotImplementedError(
@@ -110,6 +112,22 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             raise ValueError(
                 f"load_balance_mode must be 'static' or 'atomic_counter'; "
                 f"got {load_balance_mode!r}."
+            )
+        if (
+            type(head_weight_prefetch_kb) is not int
+            or head_weight_prefetch_kb < 0
+            or head_weight_prefetch_kb % 16 != 0
+        ):
+            # 16 KB granularity keeps the bulk-prefetch byte count a clean
+            # multiple of 16 (PTX requirement) with headroom.
+            raise ValueError(
+                f"head_weight_prefetch_kb must be a non-negative multiple of 16; "
+                f"got {head_weight_prefetch_kb!r}."
+            )
+        if head_weight_prefetch_kb > 0 and static_expert_shape is None:
+            raise ValueError(
+                "head_weight_prefetch_kb requires static_expert_shape (the fc1 "
+                "weight pool byte extent folds from it at trace time)."
             )
 
         self.acc_dtype = acc_dtype
@@ -138,6 +156,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         self.apply_topk_in_fc1 = apply_topk_in_fc1
         self.gate_up_clamp = gate_up_clamp
         self.epi_flag_batch = epi_flag_batch
+        self.head_weight_prefetch_kb = head_weight_prefetch_kb
 
         self._validate_mma_tiler_and_cluster_shape()
         self.mma_tiler = mma_tiler_mnk
@@ -219,6 +238,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             f"_{fc2store}_{inkred}_{apply_topk}"
             f"_fc2out{self.fc2_output_dtype.__name__}_sfvec{self.sf_vec_size}"
             f"_acc{self.acc_dtype.__name__}_clamp{self.gate_up_clamp}_epiflag{epiflag}"
+            f"_hwp{self.head_weight_prefetch_kb}"
         )
 
     def _validate_mma_tiler_and_cluster_shape(self) -> None:
@@ -2341,6 +2361,44 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             tmem.allocate(self.num_tmem_alloc_cols)
             tmem.wait_for_alloc()
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+
+            # Head-start weight prefetch (IKET head-window knob, default off).
+            # IKET (m=128 EP8): the first fc1 weight TMA fires only ~54-69 us
+            # into the launch (prologue + dispatch_prep + dispatch_barrier +
+            # first produce) while DRAM sits idle -- yet the launch is
+            # weight-bandwidth-bound (~60% of the 203 us floor).  The fc1
+            # weight stream is rank-local and consumed in expert-major order,
+            # so during that head each CTA's (otherwise parked) epilogue
+            # thread 0 hands ONE cp.async.bulk.prefetch.L2 slice of the fc1
+            # weight pool to the async proxy: CTA-linear slices tile the pool
+            # front, which is exactly the earliest-consumed span.  Pure L2
+            # hint: bitexact, robust to expert skipping, no completion
+            # tracking.  Alternatives considered: per-line prefetch.global.L2
+            # (miss-queue spam from ~600k lines), TMA preload into SMEM
+            # (needs tile identity => gated on the schedule, defeats the
+            # point).
+            if cutlass.const_expr(self.head_weight_prefetch_kb > 0):
+                if tidx == 0:
+                    slice_bytes = self.head_weight_prefetch_kb * 1024
+                    pool_bytes = (
+                        self.static_expert_shape[0]
+                        * self.static_expert_shape[1]
+                        * self.static_expert_shape[2]
+                        // 2
+                    )
+                    hwp_bidx, hwp_bidy, hwp_bidz = cute.arch.block_idx()
+                    hwp_gdx, hwp_gdy, _ = cute.arch.grid_dim()
+                    hwp_cta_linear = (
+                        hwp_bidz * (hwp_gdx * hwp_gdy) + hwp_bidy * hwp_gdx + hwp_bidx
+                    )
+                    hwp_base_off = cutlass.Int64(hwp_cta_linear) * slice_bytes
+                    # Full slices only: the partial tail slice at the pool end
+                    # is dropped (coverage targets the pool FRONT anyway).
+                    if hwp_base_off + slice_bytes <= pool_bytes:
+                        ptx_helpers.bulk_prefetch_l2_raw(
+                            fc1_weight_gemm.iterator.toint() + hwp_base_off,
+                            cutlass.Int32(slice_bytes),
+                        )
 
             optional_epi_args = NvFp4OptinalEpiArgs(
                 fc1_alpha=fc1_alpha,

@@ -202,6 +202,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         flag_batch: int = 1,
         tail_fused_reduce: bool = False,
+        head_weight_prefetch_kb: int = 0,
     ) -> None:
         # The combine wire format drives the fc2 epilogue encoder, token_comm
         # push, and the combine_quant/combine_sf workspace sizing. The dataflow
@@ -312,6 +313,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             apply_topk_in_fc1=apply_topk_in_fc1,
             gate_up_clamp=gate_up_clamp,
             epi_flag_batch=epi_flag_batch,
+            head_weight_prefetch_kb=head_weight_prefetch_kb,
         )
 
         self.enable_token_comm = True
@@ -981,6 +983,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             f"_ep_{self.world_size}_topk_{self.num_topk}_maxtoken_{self.max_tokens_per_rank}"
             f"_flagbatch_{self.flag_batch}"
             f"_tailred{int(self.tail_fused_reduce)}"
+            f"_hwp{self.head_weight_prefetch_kb}"
         )
 
     # -- AOT compile / load (TVM-FFI calling convention) ----------------------
